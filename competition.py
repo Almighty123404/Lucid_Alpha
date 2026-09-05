@@ -3,13 +3,15 @@ import os
 from simulator import save_report, save_json
 
 class Competition:
-    def __init__(self, panel, refs, teams, rounds=3, max_opt_iter=5, outdir='reports'):
+    def __init__(self, panel, refs, teams, rounds=3, max_opt_iter=5, outdir='reports',
+                 settings=None):
         self.panel = panel
         self.refs = refs
         self.teams = teams
         self.rounds = rounds
         self.max_opt_iter = max_opt_iter
         self.outdir = outdir
+        self.settings = settings
         os.makedirs(outdir, exist_ok=True)
         for t in teams:
             t['history'] = []
@@ -33,7 +35,8 @@ class Competition:
             print(f"    rationale: {idea.rationale}")
 
             expr, rep, olog = team['optimizer'].optimize(idea, self.panel, self.refs,
-                                                         self._own_refs(team), self.max_opt_iter)
+                                                         self._own_refs(team), self.max_opt_iter,
+                                                         self.settings)
             for e in olog:
                 if 'rejected_discouraged_pattern' in e:
                     print(f"[{team['optimizer'].name} Optimizer] iter {e['iteration']}: {e['rejected_discouraged_pattern']}")
@@ -105,18 +108,37 @@ class Competition:
         m = rep['metrics']
         print("    metrics:")
         print(f"      Sharpe {m['sharpe']:.2f} | Fitness {m['fitness']:.2f} | Returns {m['returns_pct']:.1f}% | "
-              f"Turnover {m['turnover_pct']:.1f}% | Drawdown {m['drawdown_pct']:.1f}%")
+              f"Turnover {m['turnover_pct']:.1f}% | Drawdown {m['drawdown_pct']:.1f}% | "
+              f"Margin {m.get('margin_bps', 0.0):.1f}bps")
         print(f"      Max weight {m['weight_concentration_pct']:.1f}% on {rep['max_weight_date']} | "
-              f"Sub-universe Sharpe {rep['criteria']['subuniverse_sharpe']['value']:.2f} | "
+              f"Sub-universe Sharpe {rep['criteria']['subuniverse_sharpe']['value']:.2f} "
+              f"(cutoff {rep.get('subuniverse_cutoff')}) | "
               f"Self-corr {rep['criteria']['self_correlation']['value']:.2f}")
+        if rep.get('max_weight_dates'):
+            tops = ', '.join(f"{w['date']} #{w['stock']} {w['weight_pct']:.2f}%"
+                             for w in rep['max_weight_dates'])
+            print(f"      Top weight dates: {tops}")
+        if rep.get('self_corr_detail'):
+            d = rep['self_corr_detail']
+            print(f"      Self-corr detail: ref '{d['ref']}' Sharpe {d['ref_sharpe']:.2f} "
+                  f"corr {d['corr']:.2f} ratio {d['ratio']:.2f} (need >= {d['required_ratio']:.2f}, "
+                  f"{d['window_days']}d window)")
+        elif rep.get('top_corr_ref'):
+            print(f"      Top corr ref: '{rep['top_corr_ref']}' Sharpe {rep.get('top_corr_ref_sharpe')} "
+                  f"signed {rep.get('top_corr_signed')} ({rep.get('top_corr_window_days')}d window)")
         print("    criteria:")
         for name, c in rep['criteria'].items():
             mark = 'PASS' if c['pass'] else 'FAIL'
             print(f"      [{mark}] {name}: {c['value']} (need {c['requirement']})")
-        print("    yearly:")
+        print("    yearly (counts warn when thin vs universe):")
         for y in rep['yearly']:
+            thin = ' THIN-COVERAGE' if y.get('thin_coverage') else ''
             print(f"      {y['year']}: Sharpe {y['sharpe']:+.2f} | Fitness {y['fitness']:.2f} | "
-                  f"Turnover {y['turnover_pct']:.1f}% | Returns {y['returns_pct']:+.1f}%")
+                  f"Turnover {y['turnover_pct']:.1f}% | Returns {y['returns_pct']:+.1f}% | "
+                  f"long {y.get('mean_long')}/{y.get('min_long')} short {y.get('mean_short')}/{y.get('min_short')}{thin}")
+        if rep.get('periods'):
+            per = ' | '.join(f"{k}: Sh {v['sharpe']:+.2f}/Fit {v['fitness']:.2f}" for k, v in rep['periods'].items())
+            print(f"    periods: {per}")
 
     def _print_leaderboard(self):
         print("\n--- LEADERBOARD ---")

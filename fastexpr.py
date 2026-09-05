@@ -5,7 +5,7 @@ class WQError(Exception):
     pass
 
 
-SYMBOLS = ['<=', '>=', '==', '!=', '<', '>', '+', '-', '*', '/', '^', '(', ')', ',', '&', '|']
+SYMBOLS = ['<=', '>=', '==', '!=', '<', '>', '+', '-', '*', '/', '^', '(', ')', ',', '&', '|', ';', '=']
 _PREC = {'|': 1, '&': 2, '<': 3, '>': 3, '<=': 3, '>=': 3, '==': 3, '!=': 3, '+': 4, '-': 4, '*': 5, '/': 5, '^': 6}
 
 
@@ -181,7 +181,91 @@ def parse(s):
     return Parser(tokenize(s)).parse()
 
 
+class Assign:
+    def __init__(self, name, expr):
+        self.name = name
+        self.expr = expr
+
+
+def _split_top_level(s):
+    """Split on ';' at paren depth 0 (Sec 4.3 multi-statement scripts)."""
+    parts, depth, cur = [], 0, []
+    for ch in s:
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        if ch == ';' and depth == 0:
+            parts.append(''.join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append(''.join(cur))
+    return parts
+
+
+def parse_program(s):
+    """Parse 'name = expr; ...; final' scripts (Sec 4.1/4.3).
+
+    Returns (bindings, final_node) where bindings is a list of Assign and
+    final_node is the alpha output expression. A trailing 'name = expr'
+    counts as the output. Bare identifiers on the RHS are fields/locals.
+    """
+    if not isinstance(s, str) or not s.strip():
+        raise WQError("Empty expression")
+    stmts = [p.strip() for p in _split_top_level(s) if p.strip()]
+    if not stmts:
+        raise WQError("Empty expression")
+    bindings = []
+    final = None
+    for i, st in enumerate(stmts):
+        toks = tokenize(st)
+        # assignment iff ID '=' ... at top level (tokens: ID, '=', rest, EOF)
+        if (len(toks) >= 3 and toks[0][0] == 'ID' and toks[1][:2] == ('SYM', '=')):
+            name = toks[0][1]
+            sub = Parser(toks[2:])
+            node = sub.or_expr()
+            if sub.peek()[0] != 'EOF':
+                t = sub.peek()
+                raise WQError(f"Unexpected token '{t[1]}' at position {t[2]}")
+            bindings.append(Assign(name, node))
+            if i == len(stmts) - 1:
+                final = Field(name)
+        else:
+            node = Parser(toks).parse()
+            if i == len(stmts) - 1:
+                final = node
+            else:
+                raise WQError(f"Only assignments allowed before the final expression (statement {i + 1})")
+    return bindings, final
+
+
+def eval_program(s, env):
+    bindings, final = parse_program(s)
+    scope = {}
+    out = None
+    for b in bindings:
+        out = _eval_with_scope(b.expr, env, scope)
+        scope[b.name] = out
+    if final is not None and not (len(bindings) and isinstance(final, Field)
+                                  and final.name == bindings[-1].name
+                                  and len(_split_top_level(s)) == len(bindings)):
+        # final bare expression distinct from trailing assignment target
+        out = _eval_with_scope(final, env, scope)
+    return out
+
+
+def _eval_with_scope(node, env, scope):
+    if not scope:
+        return eval_node(node, env)
+    scoped = Env(env.panel, verify_units=getattr(env, 'verify_units', True),
+                 locals={**getattr(env, 'locals', {}), **scope})
+    return eval_node(node, scoped)
+
+
 def _expr(n, parent):
+    if isinstance(n, Assign):
+        return f"{n.name} = {_expr(n.expr, 0)}"
     if isinstance(n, Num):
         return str(n.v)
     if isinstance(n, Field):
@@ -206,7 +290,9 @@ def to_expr(node):
 
 def iter_nodes(node):
     yield node
-    if isinstance(node, Call):
+    if isinstance(node, Assign):
+        yield from iter_nodes(node.expr)
+    elif isinstance(node, Call):
         for a in node.args:
             yield from iter_nodes(a)
     elif isinstance(node, Bin):
@@ -217,7 +303,9 @@ def iter_nodes(node):
 
 
 def transform(node, fn):
-    if isinstance(node, Call):
+    if isinstance(node, Assign):
+        node = Assign(node.name, transform(node.expr, fn))
+    elif isinstance(node, Call):
         node = Call(node.name, [transform(a, fn) for a in node.args])
     elif isinstance(node, Bin):
         node = Bin(node.op, transform(node.l, fn), transform(node.r, fn))
@@ -228,6 +316,40 @@ def transform(node, fn):
 
 def field_names(node):
     return {n.name for n in iter_nodes(node) if isinstance(n, Field)}
+
+
+def program_to_expr(bindings, final):
+    parts = [f"{b.name} = {_expr(b.expr, 0)}" for b in bindings]
+    if bindings and isinstance(final, Field) and final.name == bindings[-1].name:
+        return '; '.join(parts)
+    return '; '.join(parts + [_expr(final, 0)])
+
+
+def parse_any(s):
+    """Parse single expressions and multi-statement programs (Sec 4.3).
+
+    Returns ('single', node) or ('program', bindings, final).
+    """
+    bindings, final = parse_program(s)
+    if not bindings:
+        return ('single', final)
+    return ('program', bindings, final)
+
+
+def to_source(parsed):
+    if isinstance(parsed, tuple) and parsed and parsed[0] == 'program':
+        return program_to_expr(parsed[1], parsed[2])
+    if isinstance(parsed, tuple) and parsed and parsed[0] == 'single':
+        return to_expr(parsed[1])
+    return to_expr(parsed)
+
+
+def program_field_names(bindings, final):
+    out = set()
+    for b in bindings:
+        out |= {n.name for n in iter_nodes(b.expr) if isinstance(n, Field)}
+    out |= {n.name for n in iter_nodes(final) if isinstance(n, Field)}
+    return out - {b.name for b in bindings}
 
 
 def backfilled_fields(node):
@@ -332,11 +454,17 @@ class VectorVal:
 
 
 class Env:
-    def __init__(self, panel):
+    def __init__(self, panel, verify_units=True, locals=None):
         self.panel = panel
+        # Sec 2.6 unitHandling: VERIFY=True raises structured unit errors;
+        # OFF=False coerces leniently instead of raising.
+        self.verify_units = verify_units
+        self.locals = dict(locals) if locals else {}
 
 
 def _field(name, env):
+    if name in getattr(env, 'locals', {}):
+        return env.locals[name]
     if name in env.panel.vector_fields:
         return VectorVal(env.panel.vector_fields[name])
     if name in env.panel.fields:
@@ -348,18 +476,26 @@ def _field(name, env):
     raise WQError(f"Unknown field or identifier '{name}'")
 
 
-def _need_matrix(x, fname):
+def _need_matrix(x, fname, env=None):
     if isinstance(x, np.ndarray) and x.ndim == 2:
         return x.astype(np.float64, copy=False)
+    if env is not None and not env.verify_units:
+        # unitHandling=OFF: lenient coercion instead of structured error.
+        if isinstance(x, (int, float)):
+            T, N = env.panel.fields['returns'].shape
+            return np.full((T, N), float(x))
+        return np.full_like(env.panel.fields['returns'], np.nan)
     kind = ('scalar' if isinstance(x, (int, float)) else
             'Group' if isinstance(x, GroupVal) else
             'Vector' if isinstance(x, VectorVal) else type(x).__name__)
     raise WQError(f"Incompatible unit for input of '{fname}', expected Unit[Matrix], got Unit[{kind}]")
 
 
-def _need_group(x, fname):
+def _need_group(x, fname, env=None):
     if isinstance(x, GroupVal):
         return x
+    if env is not None and not env.verify_units:
+        return None
     kind = ('Matrix' if isinstance(x, np.ndarray) and x.ndim == 2 else
             'scalar' if isinstance(x, (int, float)) else
             'Vector' if isinstance(x, VectorVal) else type(x).__name__)
@@ -647,15 +783,25 @@ def _eval_call(node, env):
 
     if name == 'rank':
         _arity(name, ev, 1)
-        return _cs_rank(_need_matrix(ev[0], name))
+        return _cs_rank(_need_matrix(ev[0], name, env))
 
     if name == 'quantile':
-        _arity(name, ev, 1)
-        return _norm_ppf(np.clip(_cs_rank(_need_matrix(ev[0], name)), 1e-9, 1 - 1e-9))
+        # quantile(x, driver=1): 0=uniform (plain rank), 1=gaussian (default),
+        # 2=cauchy (tan(pi*(p-0.5))). Always dimensionless Unit[] (Sec 4.4).
+        _arity(name, ev, 1, 2)
+        r = np.clip(_cs_rank(_need_matrix(ev[0], name, env)), 1e-9, 1 - 1e-9)
+        driver = int(float(ev[1])) if len(ev) >= 2 else 1
+        if driver == 0:
+            return r
+        if driver == 2:
+            with np.errstate(over='ignore', invalid='ignore'):
+                out = np.tan(np.pi * (r - 0.5))
+            return np.where(np.isinf(out), np.nan, out)
+        return _norm_ppf(r)
 
     if name == 'group_neutralize':
         _arity(name, ev, 2)
-        return _group_neutralize(_need_matrix(ev[0], name), _need_group(ev[1], name))
+        return _group_neutralize(_need_matrix(ev[0], name, env), _need_group(ev[1], name, env))
 
     if name == 'if_else':
         _arity(name, ev, 3)
@@ -667,7 +813,7 @@ def _eval_call(node, env):
             out = np.where(cb, a, b)
         return np.asarray(out, dtype=np.float64)
 
-    if name in ('vec_avg', 'vec_sum', 'vec_max'):
+    if name in ('vec_avg', 'vec_sum', 'vec_max', 'vec_min'):
         _arity(name, ev, 1)
         v = ev[0]
         if not isinstance(v, VectorVal):
@@ -681,9 +827,69 @@ def _eval_call(node, env):
         if name == 'vec_max':
             s = np.where(valid, stack, -np.inf).max(0)
             return np.where(any_valid, s, np.nan)
+        if name == 'vec_min':
+            s = np.where(valid, stack, np.inf).min(0)
+            return np.where(any_valid, s, np.nan)
         cnt = valid.sum(0)
         s = np.where(valid, stack, 0.0).sum(0)
         return np.where(cnt > 0, s / np.maximum(cnt, 1), np.nan)
+
+    if name in ('vector_neut', 'group_vector_neut'):
+        # Sec 2.5: project alpha orthogonal to a risk-factor vector, per day
+        # (vector_neut) or per group-day (group_vector_neut) — not group-demean.
+        _arity(name, ev, 2, 3)
+        x = _need_matrix(ev[0], name, env)
+        f = _need_matrix(ev[1], name, env)
+        if name == 'vector_neut':
+            out = np.full_like(x, np.nan)
+            for t in range(x.shape[0]):
+                xv, fv = x[t], f[t]
+                m = np.isfinite(xv) & np.isfinite(fv)
+                if m.sum() < 2:
+                    continue
+                ff = float((fv[m] ** 2).sum())
+                beta = float((xv[m] * fv[m]).sum() / ff) if ff > 1e-12 else 0.0
+                row = np.full(x.shape[1], np.nan)
+                row[m] = xv[m] - beta * fv[m]
+                out[t] = row
+            return out
+        g = ev[2] if len(ev) >= 3 else None
+        if g is None:
+            raise WQError(f"Incompatible unit for input of '{name}', expected Unit[Group]")
+        garr = g.arr if isinstance(g, GroupVal) else _need_matrix(g, name, env)
+        def _gvneut(row, mask, t, cols):
+            xv = x[t, cols][mask]
+            fv = f[t, cols][mask]
+            ok = np.isfinite(xv) & np.isfinite(fv)
+            res = np.full_like(row, np.nan)
+            if ok.sum() < 2:
+                res[mask] = xv
+                return res
+            ff = float((fv[ok] ** 2).sum())
+            beta = float((xv[ok] * fv[ok]).sum() / ff) if ff > 1e-12 else 0.0
+            full = np.full_like(row, np.nan)
+            full[mask] = xv - beta * fv
+            return full
+        # group-wise projection reusing _group_apply plumbing
+        out = np.full_like(x, np.nan)
+        import numpy as _np
+        if isinstance(g, GroupVal):
+            for val in _np.unique(g.arr):
+                cols = g.arr == val
+                for t in range(x.shape[0]):
+                    row = x[t, cols]
+                    mask = _np.isfinite(row) & _np.isfinite(f[t, cols])
+                    if mask.sum() == 0:
+                        continue
+                    xv = row[mask]
+                    fv = f[t, cols][mask]
+                    ff = float((fv ** 2).sum())
+                    beta = float((xv * fv).sum() / ff) if ff > 1e-12 else 0.0
+                    sl = _np.full_like(row, _np.nan)
+                    sl[mask] = xv - beta * fv
+                    out[t, cols] = sl
+            return out
+        return _group_apply(x, garr, lambda row, mask: row, None)
 
     if name in ('abs', 'log', 'sign', 'sqrt'):
         _arity(name, ev, 1)
@@ -710,17 +916,17 @@ def _eval_call(node, env):
     if name == 'ts_mean':
         _arity(name, ev, 2)
         w = _need_window(node, name)
-        return _roll_mean(_need_matrix(ev[0], name), w)
+        return _roll_mean(_need_matrix(ev[0], name, env), w)
 
     if name == 'ts_std_dev':
         _arity(name, ev, 2)
         w = _need_window(node, name)
-        return _roll_std(_need_matrix(ev[0], name), w)
+        return _roll_std(_need_matrix(ev[0], name, env), w)
 
     if name == 'ts_zscore':
         _arity(name, ev, 2)
         w = _need_window(node, name)
-        x = _need_matrix(ev[0], name)
+        x = _need_matrix(ev[0], name, env)
         mean = _roll_mean(x, w)
         sd = _roll_std(x, w)
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -730,7 +936,7 @@ def _eval_call(node, env):
     if name == 'ts_decay_linear':
         _arity(name, ev, 2)
         w = _need_window(node, name)
-        x = _need_matrix(ev[0], name)
+        x = _need_matrix(ev[0], name, env)
         xm = np.where(np.isfinite(x), x, 0.0)
         vm = np.isfinite(x).astype(np.float64)
         num = np.zeros_like(xm)
@@ -746,13 +952,13 @@ def _eval_call(node, env):
     if name == 'ts_delta':
         _arity(name, ev, 2)
         w = _need_window(node, name)
-        x = _need_matrix(ev[0], name)
+        x = _need_matrix(ev[0], name, env)
         return _arith('-', x, _shift(x, w), name)
 
     if name == 'ts_backfill':
         _arity(name, ev, 2)
         w = _need_window(node, name)
-        x = _need_matrix(ev[0], name)
+        x = _need_matrix(ev[0], name, env)
         out = x.copy()
         for i in range(1, w + 1):
             miss = ~np.isfinite(out)
@@ -766,7 +972,7 @@ def _eval_call(node, env):
     if name == 'ts_rank':
         _arity(name, ev, 2)
         w = _need_window(node, name)
-        x = _need_matrix(ev[0], name)
+        x = _need_matrix(ev[0], name, env)
         valid = np.isfinite(x)
         less = np.zeros_like(x)
         cnt = np.zeros_like(x)
@@ -782,8 +988,8 @@ def _eval_call(node, env):
     if name == 'ts_covariance':
         _arity(name, ev, 3)
         w = _need_window(node, name, 2)
-        x = _need_matrix(ev[0], name)
-        y = _need_matrix(ev[1], name)
+        x = _need_matrix(ev[0], name, env)
+        y = _need_matrix(ev[1], name, env)
         valid = (np.isfinite(x) & np.isfinite(y)).astype(np.float64)
         xv = np.where(valid > 0, x, 0.0)
         yv = np.where(valid > 0, y, 0.0)
@@ -893,7 +1099,7 @@ def _eval_call(node, env):
     # ---- Batch 1: cross-sectional ----
     if name == 'zscore':
         _arity(name, ev, 1)
-        x = _need_matrix(ev[0], name)
+        x = _need_matrix(ev[0], name, env)
         mean, sd, cnt = _cs_mean_std(x)
         with np.errstate(divide='ignore', invalid='ignore'):
             out = (x - mean) / np.where(sd > 1e-12, sd, np.nan)
@@ -902,7 +1108,7 @@ def _eval_call(node, env):
     if name == 'normalize':
         # normalize(x, useStd=false, limit=0.0): demean; /std if useStd; clamp to [-limit,limit]
         _arity(name, ev, 1, 3)
-        x = _need_matrix(ev[0], name)
+        x = _need_matrix(ev[0], name, env)
         use_std = bool(ev[1]) if len(ev) >= 2 else False
         limit = float(ev[2]) if len(ev) >= 3 else 0.0
         mean, sd, cnt = _cs_mean_std(x)
@@ -916,7 +1122,7 @@ def _eval_call(node, env):
     if name == 'winsorize':
         # winsorize(x, std=4): clamp to mean +/- std*sd
         _arity(name, ev, 1, 2)
-        x = _need_matrix(ev[0], name)
+        x = _need_matrix(ev[0], name, env)
         k = float(ev[1]) if len(ev) >= 2 else 4.0
         mean, sd, cnt = _cs_mean_std(x)
         lo = mean - k * sd
@@ -926,7 +1132,7 @@ def _eval_call(node, env):
     if name == 'scale':
         # scale(x, scale=1, longscale=1, shortscale=1)
         _arity(name, ev, 1, 4)
-        x = _need_matrix(ev[0], name)
+        x = _need_matrix(ev[0], name, env)
         sc = float(ev[1]) if len(ev) >= 2 else 1.0
         ls = float(ev[2]) if len(ev) >= 3 else 1.0
         ss = float(ev[3]) if len(ev) >= 4 else 1.0
@@ -953,7 +1159,7 @@ def _eval_call(node, env):
     if name in ('group_rank', 'group_zscore', 'group_scale', 'group_mean', 'group_backfill'):
         if name == 'group_backfill':
             _arity(name, ev, 3, 4)
-            x = _need_matrix(ev[0], name)
+            x = _need_matrix(ev[0], name, env)
             w = int(ev[2]) if isinstance(ev[2], (int, float)) else 20
             g = ev[1]
             if isinstance(g, GroupVal):
@@ -973,15 +1179,15 @@ def _eval_call(node, env):
                             sub[t, miss] = mean[t]
                     out[:, cols] = sub
                 return out
-            gm = _need_matrix(g, name)
+            gm = _need_matrix(g, name, env)
             # dynamic: fill NaN with cross-group row mean
             m = np.isfinite(x)
             rowmean = np.where(m.any(1, keepdims=True), np.where(m, x, 0.0).sum(1, keepdims=True) / m.sum(1, keepdims=True).clip(min=1), np.nan)
             return np.where(np.isfinite(x), x, rowmean)
         _arity(name, ev, 2)
-        x = _need_matrix(ev[0], name)
+        x = _need_matrix(ev[0], name, env)
         g = ev[1]
-        garr = g.arr if isinstance(g, GroupVal) else _need_matrix(g, name)
+        garr = g.arr if isinstance(g, GroupVal) else _need_matrix(g, name, env)
         if name == 'group_mean':
             gm = _group_neutralize(np.where(np.isfinite(x), x, 0.0), g) if isinstance(g, GroupVal) else x
             # mean = x - neutralized(x) where valid
@@ -1023,7 +1229,7 @@ def _eval_call(node, env):
             # Parser has no strings, so numeric form only. Returns Matrix of ids (float)
             # so it composes with group_* which accept Matrix groups.
             _arity(name, ev, 2, 4)
-            x = _need_matrix(ev[0], name)
+            x = _need_matrix(ev[0], name, env)
             if len(ev) == 2:
                 n = max(2, int(float(ev[1])))
                 r = _cs_rank(x)
@@ -1039,7 +1245,7 @@ def _eval_call(node, env):
             uniq = sorted(set(x.arr.tolist()))
             remap = {v: i for i, v in enumerate(uniq)}
             return GroupVal(np.array([remap[v] for v in x.arr]))
-        m = _need_matrix(x, name)
+        m = _need_matrix(x, name, env)
         out = np.full_like(m, np.nan)
         for t in range(m.shape[0]):
             row = m[t]
@@ -1052,34 +1258,34 @@ def _eval_call(node, env):
     if name == 'ts_delay':
         _arity(name, ev, 2)
         w = _need_window(node, name)
-        return _shift(_need_matrix(ev[0], name), w)
+        return _shift(_need_matrix(ev[0], name, env), w)
 
     if name == 'ts_sum':
         _arity(name, ev, 2)
         w = _need_window(node, name)
-        return _roll_sum(_need_matrix(ev[0], name), w)
+        return _roll_sum(_need_matrix(ev[0], name, env), w)
 
     if name == 'ts_product':
         _arity(name, ev, 2)
         w = _need_window(node, name)
-        return _roll_product(_need_matrix(ev[0], name), w)
+        return _roll_product(_need_matrix(ev[0], name, env), w)
 
     if name == 'ts_count_nans':
         _arity(name, ev, 2)
         w = _need_window(node, name)
-        return _roll_count_nans(_need_matrix(ev[0], name), w)
+        return _roll_count_nans(_need_matrix(ev[0], name, env), w)
 
     if name == 'ts_av_diff':
         _arity(name, ev, 2)
         w = _need_window(node, name)
-        x = _need_matrix(ev[0], name)
+        x = _need_matrix(ev[0], name, env)
         return _arith('-', x, _roll_mean(x, w), name)
 
     if name == 'ts_scale':
         _arity(name, ev, 2, 3)
         w = _need_window(node, name)
         const = float(ev[2]) if len(ev) >= 3 else 0.0
-        x = _need_matrix(ev[0], name)
+        x = _need_matrix(ev[0], name, env)
         mn, mx = _roll_min_max(x, w)
         with np.errstate(divide='ignore', invalid='ignore'):
             out = (x - mn) / (mx - mn) + const
@@ -1095,14 +1301,14 @@ def _eval_call(node, env):
     if name in ('ts_arg_max', 'ts_arg_min'):
         _arity(name, ev, 2)
         w = _need_window(node, name)
-        x = _need_matrix(ev[0], name)
+        x = _need_matrix(ev[0], name, env)
         return _roll_arg_extreme(x, w, 'max' if name == 'ts_arg_max' else 'min')
 
     if name == 'kth_element':
         # kth_element(x, d, k): k-th most recent valid value (k=1 -> current-or-latest)
         _arity(name, ev, 3)
         w = _need_window(node, name, 1)
-        x = _need_matrix(ev[0], name)
+        x = _need_matrix(ev[0], name, env)
         k = int(float(ev[2])) if isinstance(ev[2], (int, float)) else 1
         k = max(1, k)
         T, N = x.shape
@@ -1127,7 +1333,7 @@ def _eval_call(node, env):
     if name == 'last_diff_value':
         _arity(name, ev, 2)
         w = _need_window(node, name)
-        x = _need_matrix(ev[0], name)
+        x = _need_matrix(ev[0], name, env)
         T, N = x.shape
         out = np.full_like(x, np.nan)
         for t in range(T):
@@ -1145,7 +1351,7 @@ def _eval_call(node, env):
 
     if name == 'days_from_last_change':
         _arity(name, ev, 1)
-        x = _need_matrix(ev[0], name)
+        x = _need_matrix(ev[0], name, env)
         T, N = x.shape
         out = np.full_like(x, np.nan)
         last_ch = np.full(N, np.nan)
@@ -1163,8 +1369,8 @@ def _eval_call(node, env):
     if name == 'ts_corr':
         _arity(name, ev, 3)
         w = _need_window(node, name, 2)
-        x = _need_matrix(ev[0], name)
-        y = _need_matrix(ev[1], name)
+        x = _need_matrix(ev[0], name, env)
+        y = _need_matrix(ev[1], name, env)
         T, N = x.shape
         out = np.full_like(x, np.nan)
         for t in range(w - 1, T):
@@ -1186,8 +1392,8 @@ def _eval_call(node, env):
         # ts_regression(y, x, d, lag=0, rettype=0): 0=slope 1=intercept 2=residual
         _arity(name, ev, 3, 5)
         w = _need_window(node, name, 2)
-        y = _need_matrix(ev[0], name)
-        x = _need_matrix(ev[1], name)
+        y = _need_matrix(ev[0], name, env)
+        x = _need_matrix(ev[1], name, env)
         lag = int(float(ev[3])) if len(ev) >= 4 else 0
         rettype = int(float(ev[4])) if len(ev) >= 5 else 0
         xs = _shift(x, lag) if lag else x
@@ -1217,7 +1423,7 @@ def _eval_call(node, env):
         # ts_quantile(x, d): gaussianized time-rank (driver string unsupported -> gaussian)
         _arity(name, ev, 2, 3)
         w = _need_window(node, name)
-        x = _need_matrix(ev[0], name)
+        x = _need_matrix(ev[0], name, env)
         tr = eval_node(Call('ts_rank', [node.args[0], node.args[1]]), env)
         return _norm_ppf(np.clip(tr, 1e-9, 1 - 1e-9))
 
@@ -1273,7 +1479,7 @@ def _eval_call(node, env):
         # w_t = w_{t-1} if |x_t - w_{t-1}| <= h else x_t. booksize is 1
         # after the simulator's sum|w|=1 normalization, so threshold = h.
         _arity(name, ev, 1, 2)
-        x = _need_matrix(ev[0], name)
+        x = _need_matrix(ev[0], name, env)
         h = float(ev[1]) if len(ev) >= 2 else 0.01
         T, N = x.shape
         out = np.full_like(x, np.nan)
@@ -1301,7 +1507,7 @@ def _eval_call(node, env):
         # Used as truncate(rank(signal), 0.05) to bound single-name
         # influence before the simulator's demean/scale step.
         _arity(name, ev, 1, 2)
-        x = _need_matrix(ev[0], name)
+        x = _need_matrix(ev[0], name, env)
         m = float(ev[1]) if len(ev) >= 2 else 0.05
         m = abs(m)
         return np.where(np.isfinite(x), np.clip(x, -m, m), np.nan)
@@ -1311,8 +1517,8 @@ def _eval_call(node, env):
         # after regressing on factors (plus intercept) each day.
         # x = beta*f + eps -> returns eps.
         _arity(name, ev, 2, 6)
-        x = _need_matrix(ev[0], name)
-        factors = [_need_matrix(v, name) for v in ev[1:]]
+        x = _need_matrix(ev[0], name, env)
+        factors = [_need_matrix(v, name, env) for v in ev[1:]]
         T, N = x.shape
         out = np.full_like(x, np.nan)
         for t in range(T):
@@ -1340,6 +1546,20 @@ def _eval_call(node, env):
     raise WQError(f"Unknown operator '{name}'")
 
 
+def _eval_call_scoped(node, env, scope):
+    return _eval_with_scope(node, env, scope)
+
+
+def _coerce_bin_operands(l, r, env):
+    if getattr(env, 'verify_units', True):
+        return l, r
+    def _cv(v):
+        if isinstance(v, (GroupVal, VectorVal)):
+            return np.full_like(env.panel.fields['returns'], np.nan)
+        return v
+    return _cv(l), _cv(r)
+
+
 def eval_node(node, env):
     if isinstance(node, Num):
         return node.v
@@ -1348,11 +1568,14 @@ def eval_node(node, env):
     if isinstance(node, Neg):
         x = eval_node(node.x, env)
         if isinstance(x, (GroupVal, VectorVal)):
+            if not getattr(env, 'verify_units', True):
+                return np.full_like(env.panel.fields['returns'], np.nan)
             raise WQError("Incompatible unit for input of '-', expected Unit[Matrix]")
         return -x
     if isinstance(node, Bin):
         l = eval_node(node.l, env)
         r = eval_node(node.r, env)
+        l, r = _coerce_bin_operands(l, r, env)
         if node.op in ('+', '-', '*', '/', '^'):
             return _arith(node.op, l, r, node.op)
         if node.op in ('<', '>', '<=', '>=', '==', '!='):
@@ -1363,5 +1586,10 @@ def eval_node(node, env):
             return (_boolify(l) | _boolify(r)).astype(np.float64)
         raise WQError(f"Unknown operator '{node.op}'")
     if isinstance(node, Call):
-        return _eval_call(node, env)
+        try:
+            return _eval_call(node, env)
+        except WQError as e:
+            if not getattr(env, 'verify_units', True) and 'Incompatible unit' in str(e):
+                return np.full_like(env.panel.fields['returns'], np.nan)
+            raise
     raise WQError(f"Cannot evaluate node {type(node).__name__}")

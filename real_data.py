@@ -156,6 +156,7 @@ def generate_real_panel(seed=7, n_stocks=200, start="2020-01-01", end="2022-12-3
     liq = np.nanmean(dollar_vol, axis=0)
     liq_rank = _rank1d(np.where(np.isfinite(liq), liq, 0.0))
 
+    # Sec 3.3: short-tenor IV is a sparser subset of longer-tenor coverage.
     p_iv = 0.10 + 0.85 * liq_rank[None, :] ** 2
     rv20 = _roll_std(returns, 20)
     med_rv = np.nanmedian(rv20, axis=0)
@@ -164,20 +165,23 @@ def generate_real_panel(seed=7, n_stocks=200, start="2020-01-01", end="2022-12-3
     iv_cov = rng.random((T, N)) < p_iv
     iv_black = _blackout_masks(rng, T, 1, 0.008, 0.1, 5)
     iv_cov &= ~iv_black[:, None]
+    iv_cov_60 = iv_cov
+    short_keep = (0.35 + 0.60 * liq_rank[None, :])
+    iv_cov_10 = iv_cov_60 & (rng.random((T, N)) < short_keep)
 
     def _tiny_scale(mask):
         hit = mask & (rng.random((T, N)) < 0.004) & (liq_rank[None, :] < 0.35)
         return np.where(hit, rng.uniform(0.02, 0.1, (T, N)), 1.0)
 
     skew0 = rng.normal(0.03, 0.05, N)
-    call_10 = iv_base * _tiny_scale(iv_cov) * (1.0 + rng.normal(0.0, 0.03, (T, N)))
-    call_60 = iv_base * _tiny_scale(iv_cov) * (1.0 + rng.normal(0.0, 0.05, (T, N)))
-    put_10 = iv_base * (1.0 + skew0[None, :]) * _tiny_scale(iv_cov) * (1.0 + rng.normal(0.0, 0.03, (T, N)))
-    put_60 = iv_base * (1.0 + skew0[None, :]) * _tiny_scale(iv_cov) * (1.0 + rng.normal(0.0, 0.05, (T, N)))
-    call_10 = np.where(iv_cov, call_10, np.nan)
-    call_60 = np.where(iv_cov, call_60, np.nan)
-    put_10 = np.where(iv_cov, put_10, np.nan)
-    put_60 = np.where(iv_cov, put_60, np.nan)
+    call_10 = iv_base * _tiny_scale(iv_cov_10) * (1.0 + rng.normal(0.0, 0.03, (T, N)))
+    call_60 = iv_base * _tiny_scale(iv_cov_60) * (1.0 + rng.normal(0.0, 0.05, (T, N)))
+    put_10 = iv_base * (1.0 + skew0[None, :]) * _tiny_scale(iv_cov_10) * (1.0 + rng.normal(0.0, 0.03, (T, N)))
+    put_60 = iv_base * (1.0 + skew0[None, :]) * _tiny_scale(iv_cov_60) * (1.0 + rng.normal(0.0, 0.05, (T, N)))
+    call_10 = np.where(iv_cov_10, call_10, np.nan)
+    call_60 = np.where(iv_cov_60, call_60, np.nan)
+    put_10 = np.where(iv_cov_10, put_10, np.nan)
+    put_60 = np.where(iv_cov_60, put_60, np.nan)
 
     margin = rng.beta(3.0, 12.0, N) * 0.35
     lev = np.clip(rng.normal(0.35, 0.15, N), 0.02, 0.9)

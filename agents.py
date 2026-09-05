@@ -4,7 +4,7 @@ from fastexpr import (parse, to_expr, WQError, field_names, backfilled_fields, h
                       bump_windows, add_backfill, swap_fields, wrap_ts_rank, wrap_decay,
                       wrap_group_neutralize, wrap_ts_delta, contains_group_neutralize,
                       wrap_trade_when, wrap_hump, wrap_truncate, wrap_regression_neut,
-                      iter_nodes, Call, Bin, Field, Num, Env, eval_node)
+                      iter_nodes, Call, Bin, Field, Num, Env, eval_node, eval_program)
 from simulator import simulate, failed_criteria
 
 SPARSE_TOKENS = ('nws', 'snt', 'buzz', 'news', 'implied_volatility', 'est')
@@ -37,8 +37,7 @@ class Idea:
 
 def _signal_matrix(expr_str, panel):
     try:
-        node = parse(expr_str)
-        sig = eval_node(node, Env(panel))
+        sig = eval_program(expr_str, Env(panel))
     except WQError:
         return None
     if not (isinstance(sig, np.ndarray) and sig.ndim == 2):
@@ -93,8 +92,8 @@ def _curve_sentence(yearly, overall_sharpe):
     return "mixed — uneven across years without a clean trend."
 
 
-def diagnose_component(expr_str, panel, refs=(), own_refs=()):
-    rep = simulate(expr_str, panel, refs, own_refs)
+def diagnose_component(expr_str, panel, refs=(), own_refs=(), settings=None):
+    rep = simulate(expr_str, panel, refs, own_refs, settings=settings)
     if rep.get('error'):
         return {'expr': expr_str, 'error': rep['error'], 'keep': False,
                 'reason': 'simulation error; discard.'}
@@ -251,7 +250,8 @@ def _mini(rep):
         return f"ERROR: {rep['error']}"
     m = rep['metrics']
     return (f"sharpe={m['sharpe']:.2f} fitness={m['fitness']:.2f} turnover={m['turnover_pct']:.1f}% "
-            f"conc={m['weight_concentration_pct']:.1f}% subSharpe={rep['criteria']['subuniverse_sharpe']['value']:.2f} "
+            f"conc={m['weight_concentration_pct']:.1f}% margin={m.get('margin_bps', 0.0):.1f}bps "
+            f"subSharpe={rep['criteria']['subuniverse_sharpe']['value']:.2f} "
             f"corr={rep['criteria']['self_correlation']['value']:.2f}")
 
 
@@ -268,7 +268,7 @@ class Optimizer:
         self.role = role
         self.specialty = specialty
 
-    def optimize(self, idea, panel, refs, own_refs, max_iter):
+    def optimize(self, idea, panel, refs, own_refs, max_iter, settings=None):
         log = []
         try:
             node = parse(idea.expr)
@@ -276,7 +276,7 @@ class Optimizer:
             log.append({'iteration': 0, 'action': f"could not parse idea: {e}", 'status': 'abandoned'})
             return idea.expr, {'error': str(e), 'passed': False}, log
 
-        rep = simulate(to_expr(node), panel, refs, own_refs)
+        rep = simulate(to_expr(node), panel, refs, own_refs, settings=settings)
         log.append({'iteration': 0, 'action': f"evaluated raw idea '{idea.name}'", 'expr': to_expr(node),
                     'metrics': _mini(rep), 'failed': failed_criteria(rep)})
 
@@ -291,7 +291,7 @@ class Optimizer:
         component_diags = []
         if len(comp_exprs) > 1:
             for ce in comp_exprs:
-                d = diagnose_component(ce, panel, refs, own_refs)
+                d = diagnose_component(ce, panel, refs, own_refs, settings)
                 component_diags.append(d)
                 log.append({'iteration': 0,
                             'action': f"component diagnostic: {ce[:80]}",
@@ -324,7 +324,7 @@ class Optimizer:
                     node = parse(best_leg['expr'])
                     rep = best_leg['rep']
         else:
-            d = diagnose_component(comp_exprs[0], panel, refs, own_refs)
+            d = diagnose_component(comp_exprs[0], panel, refs, own_refs, settings)
             component_diags = [d]
             log.append({'iteration': 0,
                         'action': f"standalone diagnostic: {d.get('curve', '?')} {d.get('reason', '')}",
@@ -359,7 +359,7 @@ class Optimizer:
             new_expr = to_expr(chosen['node'])
             tried.add(new_expr)
             node = chosen['node']
-            rep = simulate(new_expr, panel, refs, own_refs)
+            rep = simulate(new_expr, panel, refs, own_refs, settings=settings)
             cur_sig = _mini(rep)
             entry = {'iteration': i, 'diagnosis': chosen['diagnosis'], 'hypothesis': chosen['hypothesis'],
                      'fix': chosen['action'], 'new_expr': new_expr, 'metrics': cur_sig,

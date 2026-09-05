@@ -1,3 +1,4 @@
+import json
 import sys
 
 from data_gen import generate
@@ -27,6 +28,12 @@ def main():
     use_real = "--real" in sys.argv
     if use_real:
         sys.argv.remove("--real")
+    settings = None
+    if "--settings" in sys.argv:
+        i = sys.argv.index("--settings")
+        with open(sys.argv[i + 1]) as f:
+            settings = json.load(f)
+        del sys.argv[i:i + 2]
     rounds = int(sys.argv[1]) if len(sys.argv) > 1 else 3
     if use_real:
         if not HAS_REAL:
@@ -39,12 +46,15 @@ def main():
                   f"({str(panel.dates[0])} to {str(panel.dates[-1])})")
     else:
         panel = generate(seed=11, n_stocks=1000)
-    refs = build_reference_pool(panel, REF_EXPRS)
+    refs = build_reference_pool(panel, REF_EXPRS, settings=settings)
     print(f"Reference pool: {len(refs)} alphas")
     for r in refs:
         print(f"  {r['name']}: Sharpe {r['sharpe']:+.2f}")
     teams = make_teams(seed=5)
-    comp = Competition(panel, refs, teams, rounds=rounds, max_opt_iter=5)
+    if settings:
+        print(f"Settings: {settings}")
+    comp = Competition(panel, refs, teams, rounds=rounds, max_opt_iter=5,
+                       settings=settings)
     comp.run()
 
 
