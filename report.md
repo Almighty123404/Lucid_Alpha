@@ -11,7 +11,7 @@
 Coverage thr = max(5, 1%) = 10; early-2020 min=0 = window warmup, not a break.
 
 | # | Expression | S / F / TO% | Yearly S (Ret%) | Coverage | Shape → break |
-|---|すすめ---|---|---|---|---|
+|---|---|---|---|---|---|
 | 01 | `rank(ebitda)` | +0.89 / +0.25 / 0.14 | +0.88 / −0.89 / +2.47 | full | V-shape → breaks Jan-21 and Jan-22 |
 | 02 | `rank(sales)` | −0.93 / −0.26 / 0.06 | −1.33 / −2.06 / +0.42 | full | neg thru 2021, flat after Jan-22 |
 | 03 | `rank(debt)` | −0.11 / −0.01 / 0.05 | −0.38 / −1.44 / +1.46 | full | worst 2021, pos only after Jan-22 |
