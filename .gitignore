@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+# Downloaded market-data snapshots (regenerable via run.py --real)
+cache/*.pkl
+# Regenerable competition outputs (re-run run.py to reproduce)
+reports/round_*.json
+reports/leaderboard.json
