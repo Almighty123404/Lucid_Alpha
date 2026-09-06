@@ -54,7 +54,26 @@ def main():
         "with_real": sum(1 for r in recs if r.get("real_metrics")),
         "bias_hint": ("predicted-minus-real means; Sharpe/Fitness optimistic, "
                       "turnover/drawdown underpredicted. See calibration.summarize()."),
+        "bias_table": calibration.summarize(),
+        "expected_real": ("calibration.expected_real_adjustment() debiases sim "
+                          "metrics with the live table (min 3 pairs); "
+                          "selection.promotion_eligible(..., expect_real=...) blocks "
+                          "promotion unless bias-adjusted Sharpe/Fitness clear cutoffs. "
+                          "Opt-in 7th promotion criterion (tightening, gate-invariant)."),
     }
+    priv_path = os.path.join(ROOT, "calibration", "private_records.jsonl")
+    if os.path.exists(priv_path):
+        priv = [json.loads(line) for line in open(priv_path) if line.strip()]
+        ev = [r for r in priv if r.get("predicted_metrics") is not None]
+        ctx["calibration"]["private_pairs"] = {
+            "n": len(priv), "evaluable": len(ev),
+            "note": ("User-supplied Brain alphas, LOCAL ONLY (gitignored, never "
+                     "committed). 2026-09 batch: sim pessimistic on 4/5 evaluable "
+                     "(S deltas -0.65,-0.40,-0.10,-0.03), optimistic only on #2 "
+                     "(+0.29); TO underpredicted worst at high turnover (#2: -22.6). "
+                     "Opposite sign vs old +1.81 bias: over-correction or family mix. "
+                     "Expressions intentionally absent from this file."),
+        }
     tdir = os.path.join(ROOT, "tests")
     ctx["tests"] = sorted(f for f in os.listdir(tdir)
                           if f.startswith("test_") and f.endswith(".py"))
@@ -65,7 +84,7 @@ def main():
         "self-corr, 6 gates, trial log, risk lens, optional high-fidelity) -> "
         "agents optimize (skeleton/dimension/lesson/parsimony/alignment) -> "
         "competition promotion block (gates AND lineage AND DSR>=0.95 AND "
-        "optional StepM) -> gp evolve (3D Pareto: fitness/nodes/tail_gap) -> "
+        "optional StepM AND optional expected-real debias) -> gp evolve (3D Pareto: fitness/nodes/tail_gap) -> "
         "calibration records + risk register + runs/lessons/trials logs"
     )
     ctx["invariants"] = [

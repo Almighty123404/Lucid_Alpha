@@ -47,6 +47,130 @@ def summarize():
         keys |= set(r["real_metrics"]) & set(r["predicted_metrics"])
     return {"n": len(recs),
             **{k: round(float(np.mean([r["predicted_metrics"][k] - r["real_metrics"][k]
-                                       for r in recs if k in r["real_metrics"]
-                                       and k in r["predicted_metrics"]])), 4)
+                                        for r in recs if k in r["real_metrics"]
+                                        and k in r["predicted_metrics"]])), 4)
                for k in sorted(keys)}}
+
+
+def expected_real_adjustment(family=None, min_records=3):
+    """Bias table for the expected-real lens: mean (predicted - real) deltas.
+
+    With family=None uses all paired records (legacy global table). With a
+    family name, filters to that family's pairs and falls back to the global
+    table when the family has fewer than min_records pairs — same thin-data
+    discipline, one level down. Returns an envelope:
+    {"bias": {...}, "family": resolved_name, "n": n_used, "fallback": bool,
+     "to_slope": {...}|None}. Empty bias {} when even the global pool is thin.
+    """
+    s = summarize()
+    if s.get("n", 0) < min_records:
+        return {"bias": {}, "family": family or "global", "n": 0,
+                "fallback": True, "to_slope": None}
+    if family is None:
+        pool = [r for r in load_records()
+                if r.get("real_metrics") and r.get("predicted_metrics")]
+        fam_name, fallback = "global", False
+    else:
+        pool = [r for r in load_records()
+                if r.get("real_metrics") and r.get("predicted_metrics")
+                and family_of_expression(r.get("expression", "")) == family]
+        if len(pool) >= min_records:
+            fam_name, fallback = family, False
+        else:
+            pool = [r for r in load_records()
+                    if r.get("real_metrics") and r.get("predicted_metrics")]
+            fam_name, fallback = "global", True
+    import numpy as _np
+    keys = set()
+    for r in pool:
+        keys |= set(r["real_metrics"]) & set(r["predicted_metrics"])
+    bias = {k: round(float(_np.mean([r["predicted_metrics"][k] - r["real_metrics"][k]
+                                     for r in pool if k in r["real_metrics"]
+                                     and k in r["predicted_metrics"]])), 4)
+            for k in sorted(keys)}
+    return {"bias": bias, "family": fam_name, "n": len(pool),
+            "fallback": fallback, "to_slope": turnover_slope(pool)}
+
+
+def expected_real_metrics(sim_metrics, adjustment):
+    """Apply bias to simulated metrics. Accepts a flat bias dict (legacy) or
+    a full envelope from expected_real_adjustment (uses ["bias"] plus the
+    turnover slope when present).
+
+    Sharpe/Fitness/sub-sharpe shift by the optimism bias; turnover and
+    drawdown shift by the underprediction bias (bias is predicted-minus-real,
+    so turnover_real ~= turnover_sim - bias). With a fitted slope, turnover
+    uses TO_real ~= TO_sim - (a*TO_sim + b) instead of the additive fallback.
+    Keys missing from bias pass through unchanged. Pure function, no I/O.
+    """
+    bias = adjustment.get("bias", adjustment) if isinstance(adjustment, dict) else {}
+    slope = adjustment.get("to_slope") if isinstance(adjustment, dict) else None
+    out = dict(sim_metrics)
+    for k in ("sharpe", "fitness", "subuniverse_sharpe"):
+        if k in out and k in bias:
+            out[k] = round(out[k] - bias[k], 4)
+    for k in ("drawdown_pct",):
+        if k in out and k in bias:
+            out[k] = round(out[k] - bias[k], 4)
+    if "turnover_pct" in out:
+        if slope:
+            out["turnover_pct"] = round(
+                out["turnover_pct"] - (slope["slope"] * out["turnover_pct"]
+                                       + slope["intercept"]), 4)
+        elif "turnover_pct" in bias:
+            out["turnover_pct"] = round(out["turnover_pct"] - bias["turnover_pct"], 4)
+    return out
+
+
+def turnover_slope(pool=None, min_points=4, min_span=30.0):
+    """Linear turnover-bias model: delta (= pred - real) ~= a*TO_sim + b.
+
+    The additive correction is the wrong shape (miss grows with turnover:
+    -0.3 at 60% vs -22.6 at 69%). Returns {"slope","intercept","n","span"}
+    or None when fewer than min_points pairs or sim-TO span below min_span
+    pp — one point doesn't make a slope. Closed-form OLS, no fitting library.
+    """
+    import numpy as _np
+    if pool is None:
+        pool = [r for r in load_records()
+                if r.get("real_metrics") and r.get("predicted_metrics")]
+    pts = [(r["predicted_metrics"]["turnover_pct"], r["real_metrics"]["turnover_pct"])
+           for r in pool
+           if isinstance(r["predicted_metrics"].get("turnover_pct"), (int, float))
+           and isinstance(r["real_metrics"].get("turnover_pct"), (int, float))]
+    if len(pts) < min_points:
+        return None
+    xs = _np.array([p[0] for p in pts])
+    if float(xs.max() - xs.min()) < min_span:
+        return None
+    deltas = _np.array([p[0] - p[1] for p in pts])
+    a, b = (float(v) for v in _np.polyfit(xs, deltas, 1))
+    return {"slope": round(a, 4), "intercept": round(b, 4),
+            "n": len(pts), "span": round(float(xs.max() - xs.min()), 2)}
+
+
+_FAMILY_TOKENS = {
+    "sentiment": ("nws", "snt", "buzz", "news"),
+    "fundamental": ("ebitda", "sales", "debt", "assets", "margin", "lev", "est"),
+    "microstructure": ("returns", "close", "open", "high", "low", "volume", "adv20", "cap"),
+    "derivatives": ("implied_volatility",),
+}
+
+
+def family_of_expression(expr):
+    """Majority-vote data family from field tokens (ties -> mixed)."""
+    from fastexpr import parse, iter_nodes, Field, WQError
+    try:
+        names = {n.name for n in iter_nodes(parse(expr)) if isinstance(n, Field)}
+    except WQError:
+        return "unknown"
+    scores = {}
+    for fam, toks in _FAMILY_TOKENS.items():
+        hit = sum(1 for nm in names for t in toks if t in nm)
+        if hit:
+            scores[fam] = hit
+    if not scores:
+        return "unknown"
+    top = max(scores.values())
+    winners = [f for f, s in scores.items() if s == top]
+    return winners[0] if len(winners) == 1 else "mixed"

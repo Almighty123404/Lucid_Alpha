@@ -4,6 +4,7 @@ import os
 from simulator import save_report, save_json, simulate
 from agents import skeleton_of, node_count, combine_with_justification, failed_criteria, template_family_balance
 from selection import TrialRegistry, promotion_eligible, DSR_PROMOTE, set_scope
+from calibration import expected_real_adjustment
 
 COMPETITION_SCOPE = "competition"
 
@@ -82,6 +83,10 @@ class Competition:
         # round so every final faces identical multiplicity adjustment.
         _peers = [r["pnl"] for r in sorted(self.refs, key=lambda r: r["sharpe"],
                                            reverse=True)[:3]]
+        # Expected-real lens: per-final family bias envelope (falls back to
+        # the global table when a family has <3 pairs; self-disables when
+        # even the global pool is thin). Computed per final below.
+        from calibration import family_of_expression as _fam
         for team in self.teams:
             print(f"\n--- {team['name']} ---")
             idea = team['ideator'].propose(k)
@@ -133,13 +138,18 @@ class Competition:
             # lineage (dataset_id + logged N_trials) and DSR >= threshold.
             # Unlogged trials get DSR = 0 and are BLOCKED from history/
             # leaderboard even if all six gates pass.
+            _bias = expected_real_adjustment(_fam(rep.get("expression", "")))
             eligible, promo = promotion_eligible(rep, TrialRegistry(), DSR_PROMOTE,
                                                    COMPETITION_SCOPE,
-                                                   peer_pnls=_peers)
+                                                   peer_pnls=_peers, expect_real=_bias)
             if passed and not eligible:
                 print(f"[Promotion] BLOCKED: {'; '.join(promo['reasons'])}")
             elif passed:
                 print(f"[Promotion] ELIGIBLE: DSR={promo['dsr']} N={promo['n_trials']} ds={promo['dataset_id']}")
+            if passed and promo.get("expected_real") is not None:
+                er = promo["expected_real"]
+                print(f"[Expected-real:{promo.get('expected_real_family', '?')}] adj Sharpe {er.get('sharpe')} / Fitness {er.get('fitness')} "
+                      f"(bias-adjusted; gates evaluated on sim metrics above)")
             # Phase B5: elite crossover — if the final failed but the team has
             # a passing history, try ONE scheduled cross (best history x
             # current final, add-op). Adopted only if it passes AND beats the
@@ -161,9 +171,10 @@ class Competition:
                           f"passed={bool(crep.get('passed'))} "
                           f"failed={failed_criteria(crep)} :: {why[:80]}...")
                     if bool(crep.get('passed')) and cm['fitness'] > rep['metrics']['fitness']:
+                        _cbias = expected_real_adjustment(_fam(combo))
                         celig, cpromo = promotion_eligible(crep, TrialRegistry(), DSR_PROMOTE,
                                                              COMPETITION_SCOPE,
-                                                             peer_pnls=_peers)
+                                                             peer_pnls=_peers, expect_real=_cbias)
                         if celig:
                             print("    ADOPTED as team submission (passed and beats final)")
                             expr, rep, passed = combo, crep, True
@@ -216,7 +227,8 @@ class Competition:
             if not p:
                 continue
             _elig, _ = promotion_eligible(r, TrialRegistry(), DSR_PROMOTE,
-                                              COMPETITION_SCOPE, peer_pnls=_peers)
+                                              COMPETITION_SCOPE, peer_pnls=_peers,
+                                              expect_real=expected_real_adjustment(_fam(e)))
             if _elig:
                 passing.append((t, e, r))
         if passing:
@@ -233,7 +245,8 @@ class Competition:
             stability = round(float(1.0 / (1.0 + _np.std(ys))), 4) if ys else None
             complexity = node_count(expr)
             _elig, _promo = promotion_eligible(rep, TrialRegistry(), DSR_PROMOTE,
-                                                 COMPETITION_SCOPE, peer_pnls=_peers)
+                                                 COMPETITION_SCOPE, peer_pnls=_peers,
+                                                 expect_real=expected_real_adjustment(_fam(expr)))
             round_json['teams'].append({'team': team['name'], 'final_expression': expr,
                                         'passed': passed, 'report': slim,
                                         'stability': stability, 'complexity': complexity,

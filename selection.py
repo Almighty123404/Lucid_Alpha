@@ -139,7 +139,7 @@ class TrialRegistry:
 
 
 def promotion_eligible(rep, registry, dstar=DSR_PROMOTE, scope="default",
-                       peer_pnls=None, alpha_fw=0.05):
+                       peer_pnls=None, alpha_fw=0.05, expect_real=None):
     """Promotion block. Returns (eligible: bool, info: dict).
 
     eligible requires ALL of: non-empty dataset_id on the report, >=1 logged
@@ -154,6 +154,14 @@ def promotion_eligible(rep, registry, dstar=DSR_PROMOTE, scope="default",
     rejection set); PBO is attached as info only (uninformative below ~10
     models, never blocks alone). Peers should be the strongest alternatives
     (e.g. top-3 refs by Sharpe) so the adjustment prices real competition.
+
+    expect_real (optional): bias table from calibration.expected_real_adjustment.
+    When provided, the candidate must ALSO pass Sharpe/Fitness cutoffs on
+    bias-adjusted (expected-real) metrics. This is a TIGHTENING (a 7th
+    promotion criterion, allowed under gate invariance): with measured
+    optimism near +1.8 Sharpe it blocks simulator-passes Brain would fail —
+    e.g. real T2fb failed fitness while sim passed it. None (default)
+    preserves legacy behavior exactly; callers opt in explicitly.
     """
     dsid = rep.get("dataset_id", "")
     if not dsid:
@@ -172,6 +180,22 @@ def promotion_eligible(rep, registry, dstar=DSR_PROMOTE, scope="default",
     if dsr < dstar:
         reasons.append(f"DSR {dsr} < {dstar} (N={n}, scope={scope})")
     info = {"dsr": dsr, "n_trials": n, "scope": scope, "dataset_id": dsid[:12], "reasons": reasons}
+    if expect_real:
+        from calibration import expected_real_metrics as _erm
+        from config import get_cutoff as _gc
+        adj = _erm(rep.get("metrics", {}), expect_real)
+        info["expected_real"] = {k: adj.get(k) for k in
+                                 ("sharpe", "fitness", "turnover_pct", "drawdown_pct")}
+        info["expected_real_family"] = (expect_real.get("family", "global")
+                                        if isinstance(expect_real, dict) else "global")
+        bias_used = (expect_real.get("bias", expect_real)
+                     if isinstance(expect_real, dict) else expect_real)
+        if not bias_used:
+            info["expected_real"]["note"] = "no bias data: check vacuous, legacy verdict stands"
+        elif not (adj.get("sharpe", -99) > _gc("sharpe_min")
+                  and adj.get("fitness", -99) > _gc("fitness_min")):
+            reasons.append(f"expected-real check failed: adj Sharpe {adj.get('sharpe')} / "
+                           f"Fitness {adj.get('fitness')} below cutoffs")
     if peer_pnls:
         ok, detail = portfolio_screen(list(pnl), [list(p) for p in peer_pnls],
                                       alpha_fw=alpha_fw)

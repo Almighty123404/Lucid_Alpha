@@ -101,3 +101,69 @@ def test_simulate_logs_current_scope(panel, refs):
         assert reg.count(panel.dataset_id, scope="scope-probe-xyz") >= 1
     finally:
         sel.SCOPE = old
+
+def test_expected_real_adjustment_needs_min_records():
+    from calibration import expected_real_adjustment, expected_real_metrics
+    env = expected_real_adjustment(min_records=10 ** 9)
+    assert env["bias"] == {} and env["n"] == 0 and env["fallback"] is True
+    bias = {"sharpe": 1.0, "fitness": 0.5, "turnover_pct": -10.0, "drawdown_pct": -5.0}
+    adj = expected_real_metrics({"sharpe": 2.5, "fitness": 1.2, "turnover_pct": 30.0,
+                                 "drawdown_pct": 4.0, "other": 7}, bias)
+    assert adj["sharpe"] == 1.5 and adj["fitness"] == 0.7
+    assert adj["turnover_pct"] == 40.0 and adj["drawdown_pct"] == 9.0
+    assert adj["other"] == 7  # missing keys pass through
+
+
+def test_family_of_expression_tags():
+    from calibration import family_of_expression
+    assert family_of_expression("rank(ts_delta(ebitda, 63) / assets)") == "fundamental"
+    assert family_of_expression("-ts_zscore(returns, 21)") == "microstructure"
+    assert family_of_expression("-rank(ts_backfill(implied_volatility_put_10, 15) / ts_backfill(implied_volatility_call_10, 15))") == "derivatives"
+    assert family_of_expression("ts_mean(vec_avg(nws12_afterhsz_01l), 5)") == "sentiment"
+    assert family_of_expression("rank(ebitda) - rank(returns)") == "mixed"
+    assert family_of_expression("((((") == "unknown"
+
+
+def test_family_adjustment_falls_back_when_thin():
+    import calibration
+    env = calibration.expected_real_adjustment("microstructure")
+    assert env["family"] in ("microstructure", "global")
+    if env["family"] == "global":
+        assert env["fallback"] is True
+    else:
+        assert env["fallback"] is False and env["n"] >= 3
+
+
+def test_turnover_slope_gating_and_math():
+    import calibration
+    assert calibration.turnover_slope(pool=[], min_points=4) is None
+    tiny = [{"predicted_metrics": {"turnover_pct": t}, "real_metrics": {"turnover_pct": t - 1.0}}
+            for t in (10.0, 20.0)]
+    assert calibration.turnover_slope(pool=tiny, min_points=4) is None  # too few points
+    narrow = [{"predicted_metrics": {"turnover_pct": t}, "real_metrics": {"turnover_pct": t - 1.0}}
+              for t in (10.0, 12.0, 14.0, 16.0, 18.0)]
+    assert calibration.turnover_slope(pool=narrow, min_span=30.0) is None  # span too small
+    wide = [{"predicted_metrics": {"turnover_pct": t}, "real_metrics": {"turnover_pct": 2.0 * t + 5.0}}
+            for t in (5.0, 20.0, 40.0, 70.0)]
+    s = calibration.turnover_slope(pool=wide)
+    assert s is not None and abs(s["slope"] - (-1.0)) < 1e-9 and abs(s["intercept"] - (-5.0)) < 1e-9
+    assert s["n"] == 4
+    # slope applied through expected_real_metrics
+    adj = calibration.expected_real_metrics(
+        {"turnover_pct": 50.0}, {"bias": {}, "to_slope": s})
+    assert adj["turnover_pct"] == 50.0 - (-1.0 * 50.0 + -5.0)
+
+
+def test_promotion_expected_real_blocks_and_passes(panel, refs):
+    from simulator import simulate
+    from selection import TrialRegistry, promotion_eligible, DSR_PROMOTE
+    rep = simulate("ts_decay_linear(-ts_zscore(returns, 21), 10)", panel, refs, (), settings=None)
+    reg = TrialRegistry()
+    mild = {"sharpe": 0.1, "fitness": 0.1}
+    el, info = promotion_eligible(rep, reg, DSR_PROMOTE, "default", expect_real=mild)
+    assert "expected_real" in info
+    assert el == (info["dsr"] >= DSR_PROMOTE and rep.get("passed", False)), info
+    harsh = {"sharpe": 99.0, "fitness": 99.0}
+    el2, info2 = promotion_eligible(rep, reg, DSR_PROMOTE, "default", expect_real=harsh)
+    assert el2 is False
+    assert any("expected-real" in r for r in info2["reasons"])
