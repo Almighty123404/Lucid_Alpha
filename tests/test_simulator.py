@@ -118,3 +118,13 @@ def test_cost_lens_never_enters_gates(panel, refs):
     assert rep2["metrics"]["cost_drag_pct"] == pytest.approx(m["cost_drag_pct"] * 5.0, rel=1e-3)
     # gates identical regardless of cost assumption
     assert rep2["criteria"] == rep["criteria"]
+
+def test_returns_geo_matches_cagr_definition(panel, refs):
+    import numpy as np
+    rep = simulate("ts_decay_linear(-ts_zscore(returns, 21), 10)", panel, refs, (), settings=None)
+    m = rep["metrics"]
+    x = rep["pnl"][1:] / 0.5
+    expect = (float(np.prod(1.0 + x)) ** (252.0 / len(x)) - 1.0) * 100.0
+    assert m["returns_geo_pct"] == pytest.approx(expect, abs=1e-3)
+    # linear annualization understates compounding for this profitable alpha
+    assert m["returns_geo_pct"] >= m["returns_pct"]

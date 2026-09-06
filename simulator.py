@@ -242,6 +242,14 @@ def _pnl_series(Wd, R):
     # plus the _rolling_self_corr note is the guard. See QuantML
     # wq-alpha-research skill README (daily-changes rule) and xiegengcai
     # DeepWiki self-corr (pnl-ffill-shift convention).
+    #
+    # RAW-vs-LOG decision (2026-09-06, Haugh notes Ex.1): day-t P&L as
+    # sum(Wd[t-1]*R[t]) in SIMPLE returns is EXACT for a daily-rebalanced
+    # book, not a Taylor approximation — the linear form L~=-V.w'X is exact
+    # over one holding period by construction of the weights. Log returns
+    # would be wrong here (log-portfolio-return is not linear in weights).
+    # The approximation question only arises multi-period (see CAGR below)
+    # and for large single-day moves (see validate_panel 1+r>0 guard).
     T = Wd.shape[0]
     pnl = np.zeros(T)
     pnl[1:] = (Wd[:-1] * R[1:]).sum(1)
@@ -354,6 +362,16 @@ def _metrics_from_weights(Wd, R, book_size=1.0, floor=0.125, annualization=252.0
     invested = book_size / 2.0  # Sec 6 SOURCED: invested == half of book
     ret_ann = float(x.mean() * annualization / invested) if invested > 0 else 0.0
     fitness = _fitness(sharpe, ret_ann, turnover, floor)
+    # Raw-vs-log, multi-period leg (2026-09-06): ret_ann linearizes
+    # (mean*252), which UNDERSTATES compounded growth for profitable alphas
+    # (measured T2fb: 14.70% linear vs 15.53% CAGR) and overstates it for
+    # volatile losers. Report geometric CAGR alongside (reporting only, never
+    # gates — Brain parity stays on the linear convention).
+    rx = x / invested if invested > 0 else x * 0.0
+    if len(rx) > 0 and bool((1.0 + rx > 0).all()):
+        ret_geo = float(np.prod(1.0 + rx) ** (annualization / len(rx)) - 1.0)
+    else:
+        ret_geo = float('nan')  # a <=-100% day makes compounding undefined
     cum = np.cumsum(x)
     dd = float((np.maximum.accumulate(cum) - cum).max() / book_size * 100.0) if len(cum) else 0.0
     total_traded = float(turns[1:].sum() * book_size) if len(turns) > 1 else 0.0
@@ -380,6 +398,7 @@ def _metrics_from_weights(Wd, R, book_size=1.0, floor=0.125, annualization=252.0
         'fitness': fitness,
         'turnover_pct': turnover * 100.0,
         'returns_pct': ret_ann * 100.0,
+        'returns_geo_pct': ret_geo * 100.0,
         'drawdown_pct': dd,
         'margin_bps': margin_bps,
         'weight_concentration_pct': float(aw[mi]) / book_size * 100.0,
@@ -676,6 +695,19 @@ def simulate(expr_str, panel, refs=(), own_refs=(), settings=None, cutoffs=None,
             Wd, R, panel.fields.get('adv20', None), exec_cfg,
             book_size=book, annualization=ann)
         rep['exec_settings'] = {k: exec_cfg[k] for k in sorted(exec_cfg)}
+    # Risk lens (Haugh Ch.2): VaR/ES reporting next to Sharpe metrics.
+    # Diagnostic-only like the cost lens — never enters gates/fitness.
+    try:
+        import risk as _risk
+        rr = _risk.risk_report(m['pnl'])
+        _cond = _risk.conditional_risk(m['pnl'])
+        _ok = np.isfinite(_cond['t_es'])
+        rr['cond_t_es_latest'] = float(_cond['t_es'][_ok][-1]) if _ok.any() else float('nan')
+        rr['cond_hist_es_latest'] = float(_cond['hist_es'][_ok][-1]) if _ok.any() else float('nan')
+        rr['exceedance'] = _risk.exceedance_backtest(m['pnl'], _cond['hist_var'])
+        rep['risk'] = rr
+    except Exception:
+        pass
     return rep
 
 

@@ -505,6 +505,11 @@ def validate_panel(panel):
         raise ValueError("panel dates not strictly increasing")
     if float(np.isfinite(panel.fields['close']).mean()) < 0.95:
         raise ValueError("close coverage below 95% (delistings account for ~3%)")
+    # Raw-vs-log large-move guard (2026-09-06): cumprod(1+r) breaks at r<=-1.
+    # The deliberate -50% delist print is the floor; anything at/below -100%
+    # is a generator bug, not a market event.
+    if bool((panel.fields['returns'][np.isfinite(panel.fields['returns'])] <= -1.0).any()):
+        raise ValueError("returns at/below -100% would break price compounding")
     if float(np.isfinite(panel.fields['adv20'][20:]).mean()) < 0.90:
         raise ValueError("adv20 coverage below 90% past 20d warmup")
     KEL = np.isfinite(panel.fields['close']).sum(axis=1)

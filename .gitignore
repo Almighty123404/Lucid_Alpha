@@ -12,3 +12,4 @@ reports/walkforward.json
 reports/runs.jsonl
 reports/trials.jsonl
 reports/gp_campaign.json
+context.json

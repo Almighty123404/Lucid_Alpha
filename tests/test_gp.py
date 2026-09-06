@@ -42,6 +42,20 @@ def test_pareto_front_nondominated():
     assert (2.0, 9) not in got and (1.0, 5) not in got  # dominated dropped
 
 
+def test_pareto_tail_gap_breaks_ties():
+    rs = [{"status": "evaluated", "fitness": 1.0, "nodes": 5,
+           "tail_gap": g, "expr": str(i)} for i, g in enumerate([0.02, 0.005])]
+    hof = pareto_front(rs)
+    assert len(hof) == 1 and hof[0]["tail_gap"] == 0.005  # thinner tail wins
+
+
+def test_evaluate_attaches_tail_gap(panel, refs):
+    from gp import evaluate
+    r = evaluate("ts_decay_linear(-ts_zscore(returns, 21), 10)", panel, refs)
+    assert r["status"] == "evaluated"
+    assert isinstance(r["tail_gap"], float) and r["tail_gap"] == r["tail_gap"]
+
+
 def test_evaluate_prunes_without_simulating():
     deep = "rank(returns)"
     for _ in range(16):

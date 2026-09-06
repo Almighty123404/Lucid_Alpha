@@ -276,6 +276,15 @@ class Competition:
               f"Sub-universe Sharpe {rep['criteria']['subuniverse_sharpe']['value']:.2f} "
               f"(cutoff {rep.get('subuniverse_cutoff')}) | "
               f"Self-corr {rep['criteria']['self_correlation']['value']:.2f}")
+        if rep.get('risk'):
+            rr = rep['risk']
+            h95 = rr.get('hist', {}).get('0.95', {})
+            t99 = rr.get('t', {}).get('0.99', {})
+            ex = rr.get('exceedance', {})
+            print(f"      Risk lens: VaR95 {h95.get('var', float('nan')):.4f} | ES95 {h95.get('es', float('nan')):.4f} | "
+                  f"t-ES99 {t99.get('es', float('nan')):.4f} (gap {rr.get('es_gap_t_vs_normal_99', float('nan')):+.4f}) | "
+                  f"cond t-ES {rr.get('cond_t_es_latest', float('nan')):.4f} | "
+                  f"exceed {ex.get('exceed', '?')}/{ex.get('n', '?')} (exp {ex.get('expected', '?')}, {ex.get('verdict', '?')})")
         if rep.get('max_weight_dates'):
             tops = ', '.join(f"{w['date']} #{w['stock']} {w['weight_pct']:.2f}%"
                              for w in rep['max_weight_dates'])

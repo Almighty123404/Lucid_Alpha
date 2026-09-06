@@ -180,23 +180,34 @@ def evaluate(expr, panel, refs, own_refs=(), settings=None):
     score = _score(rep, expr)
     elig, promo = promotion_eligible(rep, TrialRegistry(), DSR_PROMOTE,
                                      _selection.SCOPE)
+    tail_gap = rep.get("risk", {}).get("es_gap_t_vs_normal_99", float("inf"))
+    if tail_gap != tail_gap:  # NaN (degenerate lens) sorts as +inf: never wins ties
+        tail_gap = float("inf")
     return {"expr": expr, "status": "evaluated", "sharpe": rep["metrics"]["sharpe"],
             "fitness": rep["metrics"]["fitness"], "passed": bool(rep.get("passed")),
             "failed": failed_criteria(rep), "score": score, "diag": diag,
-            "eligible": elig, "promotion": promo,
+            "eligible": elig, "promotion": promo, "tail_gap": tail_gap,
             "skeleton": skeleton_of(expr), "nodes": node_count(expr)}
 
 
 def _dominated(a, b):
-    """a dominated by b on (fitness up, nodes down): b better-or-equal on
-    both axes (elementwise — NOT lexicographic tuple comparison, which
-    short-circuits on the first axis) and strictly better on at least one."""
-    return (b["fitness"] >= a["fitness"] and b["nodes"] <= a["nodes"]) and \
-        (b["fitness"] > a["fitness"] or b["nodes"] < a["nodes"])
+    """a dominated by b on (fitness up, nodes down, tail_gap down).
+
+    Elementwise on all three axes — NOT lexicographic tuple comparison,
+    which short-circuits on the first axis. Missing tail_gap reads as +inf
+    on both sides, which reduces exactly to the legacy 2D rule, so old
+    result dicts keep working unchanged.
+    """
+    ga, gb = a.get("tail_gap", float("inf")), b.get("tail_gap", float("inf"))
+    better_eq = (b["fitness"] >= a["fitness"] and b["nodes"] <= a["nodes"]
+                 and gb <= ga)
+    strictly = (b["fitness"] > a["fitness"] or b["nodes"] < a["nodes"]
+                or gb < ga)
+    return bool(better_eq and strictly)
 
 
 def pareto_front(results):
-    """Non-dominated subset on (fitness up, nodes down) — the hall of fame."""
+    """Non-dominated subset on (fitness up, nodes down, tail_gap down)."""
     ev = [r for r in results if r.get("status") == "evaluated"]
     return [a for a in ev if not any(_dominated(a, b) for b in ev if b is not a)]
 
@@ -208,7 +219,10 @@ def evolve(panel, refs, seed=0, population=24, generations=2, max_depth=3,
 
     Selection: truncation (elites clone; parents sampled from top-10 by
     _score order). Children come from crossover (cx_rate), mutation
-    (mut_rate), or fresh random trees. Production: population 300-1000,
+    (mut_rate), or fresh random trees. The hall of fame is the 3D Pareto
+    front on (fitness up, nodes down, tail_gap down), so risk-steering acts
+    at selection output: among equal-fitness/nodes candidates, the thinner
+    tail wins a hall slot. Production: population 300-1000,
     generations 20-50 on a SMALL search panel; validate finalists on the
     full panel before any promotion claim.
 
@@ -240,8 +254,11 @@ def evolve(panel, refs, seed=0, population=24, generations=2, max_depth=3,
         ev = [r for r in results if r.get("status") == "evaluated"]
         npass = sum(1 for r in ev if r["passed"])
         best = max(ev, key=lambda r: r["score"]) if ev else None
+        gaps = [r.get("tail_gap", float("inf")) for r in ev]
+        gaps = [g for g in gaps if g == g]
         log.append({"generation": g, "evaluated": len(ev),
                     "pruned": len(results) - len(ev), "passed": npass,
+                    "best_tail_gap": min(gaps) if gaps else None,
                     "best": (best["expr"][:80], best["score"]) if best else None})
         ranked = sorted(ev, key=lambda r: r["score"], reverse=True)
         elites = [r["expr"] for r in ranked[:elite]]
