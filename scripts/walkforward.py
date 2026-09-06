@@ -70,6 +70,8 @@ def haircut_sharpe(observed, n_trials, n_obs_years=2.0):
 
 
 def main():
+    from selection import set_scope
+    set_scope("walkforward")  # scoped registry: WF trials tax only WF multiplicity
     panel = generate(seed=11, n_stocks=1000)
     train = slice_panel(panel, "2020-01-01", "2021-12-31")
     test = slice_panel(panel, "2022-01-01", "2022-12-31")

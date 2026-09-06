@@ -3,7 +3,9 @@ import os
 
 from simulator import save_report, save_json, simulate
 from agents import skeleton_of, node_count, combine_with_justification, failed_criteria, template_family_balance
-from selection import TrialRegistry, promotion_eligible, DSR_PROMOTE
+from selection import TrialRegistry, promotion_eligible, DSR_PROMOTE, set_scope
+
+COMPETITION_SCOPE = "competition"
 
 LESSONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             'reports', 'lessons.jsonl')
@@ -64,6 +66,9 @@ class Competition:
             t['rescue'] = []  # Phase B5: near-miss finals (failed exactly 1 gate, no error)
         fams = template_family_balance([tpl for t in teams for tpl in t['ideator'].templates])
         print(f"[Competition] template families: {fams['counts']} ({fams['balancer']})")
+        # Scoped registry: this competition's trials (including optimizer
+        # internals) count toward ITS multiplicity only, never GP campaigns'.
+        set_scope(COMPETITION_SCOPE)
 
     def _own_refs(self, team):
         return [{'team': team['id'], 'name': f"round{h['round']}", 'pnl': h['pnl'], 'sharpe': h['sharpe']}
@@ -73,6 +78,10 @@ class Competition:
         print()
         print(f"================ ROUND {k} ================")
         results = []
+        # RR-14/Romano-Wolf: StepM peers = top-3 refs by Sharpe, fixed for the
+        # round so every final faces identical multiplicity adjustment.
+        _peers = [r["pnl"] for r in sorted(self.refs, key=lambda r: r["sharpe"],
+                                           reverse=True)[:3]]
         for team in self.teams:
             print(f"\n--- {team['name']} ---")
             idea = team['ideator'].propose(k)
@@ -124,7 +133,9 @@ class Competition:
             # lineage (dataset_id + logged N_trials) and DSR >= threshold.
             # Unlogged trials get DSR = 0 and are BLOCKED from history/
             # leaderboard even if all six gates pass.
-            eligible, promo = promotion_eligible(rep, TrialRegistry(), DSR_PROMOTE)
+            eligible, promo = promotion_eligible(rep, TrialRegistry(), DSR_PROMOTE,
+                                                   COMPETITION_SCOPE,
+                                                   peer_pnls=_peers)
             if passed and not eligible:
                 print(f"[Promotion] BLOCKED: {'; '.join(promo['reasons'])}")
             elif passed:
@@ -150,7 +161,9 @@ class Competition:
                           f"passed={bool(crep.get('passed'))} "
                           f"failed={failed_criteria(crep)} :: {why[:80]}...")
                     if bool(crep.get('passed')) and cm['fitness'] > rep['metrics']['fitness']:
-                        celig, cpromo = promotion_eligible(crep, TrialRegistry(), DSR_PROMOTE)
+                        celig, cpromo = promotion_eligible(crep, TrialRegistry(), DSR_PROMOTE,
+                                                             COMPETITION_SCOPE,
+                                                             peer_pnls=_peers)
                         if celig:
                             print("    ADOPTED as team submission (passed and beats final)")
                             expr, rep, passed = combo, crep, True
@@ -202,7 +215,8 @@ class Competition:
         for t, e, r, p in results:
             if not p:
                 continue
-            _elig, _ = promotion_eligible(r, TrialRegistry(), DSR_PROMOTE)
+            _elig, _ = promotion_eligible(r, TrialRegistry(), DSR_PROMOTE,
+                                              COMPETITION_SCOPE, peer_pnls=_peers)
             if _elig:
                 passing.append((t, e, r))
         if passing:
@@ -218,7 +232,8 @@ class Competition:
             import numpy as _np
             stability = round(float(1.0 / (1.0 + _np.std(ys))), 4) if ys else None
             complexity = node_count(expr)
-            _elig, _promo = promotion_eligible(rep, TrialRegistry(), DSR_PROMOTE)
+            _elig, _promo = promotion_eligible(rep, TrialRegistry(), DSR_PROMOTE,
+                                                 COMPETITION_SCOPE, peer_pnls=_peers)
             round_json['teams'].append({'team': team['name'], 'final_expression': expr,
                                         'passed': passed, 'report': slim,
                                         'stability': stability, 'complexity': complexity,

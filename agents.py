@@ -193,16 +193,16 @@ def _dim_of(node, scope=()):
     if isinstance(node, Neg):
         return _dim_of(node.x, scope)
     if isinstance(node, Bin):
+        # Always validate children first: free operators (*, /, comparisons)
+        # must not hide nested additive mismatches (e.g. rank(close+volume)).
+        dl, dr = _dim_of(node.l, scope), _dim_of(node.r, scope)
         if node.op in ('+', '-'):
-            dl, dr = _dim_of(node.l, scope), _dim_of(node.r, scope)
             if 'NUM' in (dl, dr):
                 return dl if dr == 'NUM' else dr
             if dl != dr:
                 raise WQError(f"dimension mismatch: {dl} {node.op} {dr}")
             return dl
-        if node.op in ('<', '>', '<=', '>=', '==', '!='):
-            return 'BOOL'
-        if node.op in ('&', '|'):
+        if node.op in ('<', '>', '<=', '>=', '==', '!=', '&', '|'):
             return 'BOOL'
         return 'DERIVED'
     if isinstance(node, Call):
@@ -248,7 +248,11 @@ def _dim_of(node, scope=()):
                 if _dim_of(a, scope) != 'VECTOR':
                     raise WQError(f"{node.name} expects a Vector field")
             return 'LESS'
+        for a in node.args:  # unknown ops: still validate args, result free
+            _dim_of(a, scope)
         return 'DERIVED'
+    if isinstance(node, Assign):
+        return _dim_of(node.expr, scope)
     return 'LESS'
 
 

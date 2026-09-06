@@ -23,6 +23,7 @@ from agents import (diagnose_component, compare_combined_vs_individual,
                     _score)
 from simulator import simulate, failed_criteria
 from selection import TrialRegistry, promotion_eligible, DSR_PROMOTE
+import selection as _selection  # for current SCOPE in evaluate()
 
 NODE_CAP = 40  # Phase A3 parsimony: reject proposals above this pre-simulate
 
@@ -177,7 +178,8 @@ def evaluate(expr, panel, refs, own_refs=(), settings=None):
     if rep.get("error"):
         return {"expr": expr, "status": "error", "error": rep["error"], "diag": diag}
     score = _score(rep, expr)
-    elig, promo = promotion_eligible(rep, TrialRegistry(), DSR_PROMOTE)
+    elig, promo = promotion_eligible(rep, TrialRegistry(), DSR_PROMOTE,
+                                     _selection.SCOPE)
     return {"expr": expr, "status": "evaluated", "sharpe": rep["metrics"]["sharpe"],
             "fitness": rep["metrics"]["fitness"], "passed": bool(rep.get("passed")),
             "failed": failed_criteria(rep), "score": score, "diag": diag,

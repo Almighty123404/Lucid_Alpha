@@ -16,16 +16,30 @@ Pieces:
 import json
 import math
 import os
+from itertools import combinations
+
+import numpy as np
 
 TRIALS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            'reports', 'trials.jsonl')
 AUTO_LOG = True  # simulate() logs every trial; tests set False or redirect
+SCOPE = "default"  # research-question namespace for N_trials multiplicity.
+# Multiplicity is only meaningful within one search: campaign trials must not
+# tax competition candidates or vice versa. Entry points set this once
+# (competition -> "competition", gp_campaign -> "gp-campaign", walkforward ->
+# "walkforward"); count()/promotion_eligible() filter on it. None = all scopes
+# (legacy/audit reads only, never promotion).
 DSR_PROMOTE = 0.95  # Agent 4 threshold: DSR>=0.95 promotes, 0.5 = coin flip
 
 
 def set_trials_path(path):
     global TRIALS_PATH
     TRIALS_PATH = path
+
+
+def set_scope(scope):
+    global SCOPE
+    SCOPE = scope or "default"
 
 
 def _phi(x):
@@ -80,13 +94,15 @@ class TrialRegistry:
     def __init__(self, path=None):
         self.path = path or TRIALS_PATH
 
-    def log(self, skeleton, dataset_id, settings, sharpe, fitness, passed):
+    def log(self, skeleton, dataset_id, settings, sharpe, fitness, passed,
+            scope=None):
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             with open(self.path, "a") as f:
                 f.write(json.dumps({"skeleton": skeleton, "dataset_id": dataset_id,
                                     "settings": settings, "sharpe": sharpe,
-                                    "fitness": fitness, "passed": bool(passed)},
+                                    "fitness": fitness, "passed": bool(passed),
+                                    "scope": scope or SCOPE},
                                    default=str) + "\n")
         except OSError:
             pass
@@ -104,32 +120,47 @@ class TrialRegistry:
         except OSError:
             return
 
-    def count(self, dataset_id=None):
+    def count(self, dataset_id=None, scope="default"):
+        """Trial count, optionally filtered. scope=None counts ALL scopes
+        (audit/legacy reads); promotion always passes an explicit scope."""
         n = 0
         for e in self._iter():
-            if dataset_id is None or e.get("dataset_id") == dataset_id:
-                n += 1
+            if dataset_id is not None and e.get("dataset_id") != dataset_id:
+                continue
+            if scope is not None and e.get("scope", "default") != scope:
+                continue
+            n += 1
         return n
 
-    def has_dataset(self, dataset_id):
+    def has_dataset(self, dataset_id, scope="default"):
         if not dataset_id:
             return False
-        return self.count(dataset_id) > 0
+        return self.count(dataset_id, scope) > 0
 
 
-def promotion_eligible(rep, registry, dstar=DSR_PROMOTE):
+def promotion_eligible(rep, registry, dstar=DSR_PROMOTE, scope="default",
+                       peer_pnls=None, alpha_fw=0.05):
     """Promotion block. Returns (eligible: bool, info: dict).
 
     eligible requires ALL of: non-empty dataset_id on the report, >=1 logged
-    trial for that dataset (the N_trials entry), gates passed, DSR >= dstar.
-    Missing lineage -> DSR reported as 0.0 and eligible False, always.
+    trial for that dataset IN THE GIVEN SCOPE (the N_trials entry), gates
+    passed, DSR >= dstar (computed with scoped N). Missing lineage -> DSR
+    reported as 0.0 and eligible False, always. scope=None counts all scopes
+    and is for audit reads only, never promotion.
+
+    peer_pnls (optional): list of peer daily-PnL series for the Romano-Wolf
+    portfolio screen. When provided, the candidate must ALSO survive StepM
+    FWER control at alpha_fw against the peers (pass = candidate in the
+    rejection set); PBO is attached as info only (uninformative below ~10
+    models, never blocks alone). Peers should be the strongest alternatives
+    (e.g. top-3 refs by Sharpe) so the adjustment prices real competition.
     """
     dsid = rep.get("dataset_id", "")
     if not dsid:
         return False, {"dsr": 0.0, "reasons": ["missing dataset_id: DSR=0, blocked"]}
-    n = registry.count(dsid)
+    n = registry.count(dsid, scope)
     if n < 1:
-        return False, {"dsr": 0.0, "reasons": [f"no logged N_trials entry for dataset {dsid[:8]}: DSR=0, blocked"]}
+        return False, {"dsr": 0.0, "reasons": [f"no logged N_trials entry for dataset {dsid[:8]} (scope={scope}): DSR=0, blocked"]}
     pnl = rep.get("pnl", [])
     dsr = deflated_sharpe_ratio(list(pnl), n)
     reasons = []
@@ -139,6 +170,179 @@ def promotion_eligible(rep, registry, dstar=DSR_PROMOTE):
         from simulator import failed_criteria as _fc
         reasons.append(f"gates failed: {_fc(rep)}")
     if dsr < dstar:
-        reasons.append(f"DSR {dsr} < {dstar} (N={n})")
-    info = {"dsr": dsr, "n_trials": n, "dataset_id": dsid[:12], "reasons": reasons}
+        reasons.append(f"DSR {dsr} < {dstar} (N={n}, scope={scope})")
+    info = {"dsr": dsr, "n_trials": n, "scope": scope, "dataset_id": dsid[:12], "reasons": reasons}
+    if peer_pnls:
+        ok, detail = portfolio_screen(list(pnl), [list(p) for p in peer_pnls],
+                                      alpha_fw=alpha_fw)
+        info["stepm"] = detail
+        if not ok:
+            reasons.append(f"StepM FWER screen failed at {alpha_fw} "
+                           f"(candidate adj-p {detail['candidate_adj_p']}, "
+                           f"{detail['n_models']} models)")
     return (len(reasons) == 0), info
+
+
+# ---------------------------------------------------------------------------
+# Portfolio-level false-discovery control (RR-14 next_check). DSR is
+# per-alpha; as mining scales to hundreds of trials, promotion additionally
+# requires surviving a Romano-Wolf StepM screen against peer return streams.
+# PBO is reported as a diagnostic (informative only at >=10 models).
+# ---------------------------------------------------------------------------
+
+def _stationary_bootstrap_index(T, B, q, rng):
+    """Politis-Romano stationary bootstrap: BxT index array, mean block 1/q."""
+    idx = np.zeros((B, T), dtype=np.int64)
+    for b in range(B):
+        t = 0
+        start = int(rng.integers(T))
+        while t < T:
+            L = 1 + int(rng.geometric(q))
+            for k in range(L):
+                if t >= T:
+                    break
+                idx[b, t] = (start + k) % T
+                t += 1
+            start = int(rng.integers(T))
+    return idx
+
+
+def _tstat(d):
+    d = np.asarray(d, dtype=np.float64)
+    d = d[np.isfinite(d)]
+    n = len(d)
+    if n < 30:
+        return 0.0
+    sd = d.std(ddof=1)
+    if sd < 1e-12:
+        return 0.0
+    return float(d.mean() / (sd / math.sqrt(n)))
+
+
+def white_reality_check(candidate, benchmark, B=500, q=0.1, seed=0):
+    """White (2000) Reality Check: does the candidate beat the benchmark,
+    accounting for having looked? Single-hypothesis bootstrap max-t test.
+    Returns (reject: bool, p_value)."""
+    cand = np.asarray(candidate[1:], dtype=np.float64)
+    bench = np.asarray(benchmark[1:], dtype=np.float64)
+    n = min(len(cand), len(bench))
+    if n < 30:
+        return False, 1.0
+    d = cand[-n:] - bench[-n:]
+    t_obs = _tstat(d)
+    if t_obs <= 0:
+        return False, 1.0
+    rng = np.random.default_rng(seed)
+    idx = _stationary_bootstrap_index(n, B, q, rng)
+    # Recenter by the ORIGINAL mean (H0: mu = 0 in bootstrap world). Subtracting
+    # the bootstrap sample's own mean instead would force every bootstrap
+    # t-stat to exactly 0 and reject everything — caught by unit test.
+    db = d[idx] - d.mean()
+    t_boot = np.array([_tstat(db[b]) for b in range(B)])
+    p = float((t_boot >= t_obs).mean())
+    return bool(p < 0.05), round(p, 4)
+
+
+def romano_wolf_stepm(model_pnls, benchmark_pnl=None, alpha=0.05, B=500,
+                      q=0.1, seed=0):
+    """Romano-Wolf (2005) StepM: which models beat the benchmark with FWER
+    control at `alpha`? model_pnls: list of daily series; benchmark defaults
+    to zeros (i.e., any positive edge). Returns (rejected_idx, adj_p list)
+    with stepdown-adjusted p-values (monotone, sharper than Holm)."""
+    Ms = [np.asarray(m[1:], dtype=np.float64) for m in model_pnls]
+    n = min([len(m) for m in Ms])
+    if benchmark_pnl is None:
+        bench = np.zeros(n)
+    else:
+        bench = np.asarray(benchmark_pnl[1:], dtype=np.float64)[-n:]
+    Ms = [m[-n:] for m in Ms]
+    K = len(Ms)
+    if n < 30 or K < 1:
+        return [], [1.0] * K
+    D = np.array([m - bench for m in Ms])
+    t_obs = np.array([_tstat(D[k]) for k in range(K)])
+    order = list(np.argsort(-t_obs))
+    rng = np.random.default_rng(seed)
+    idx = _stationary_bootstrap_index(n, B, q, rng)
+    adj = [1.0] * K
+    remaining = list(order)
+    step_p = 0.0
+    rej = []
+    while remaining:
+        # bootstrap max-t over remaining models, recentered by ORIGINAL means
+        # (least-favorable null; same caveat as White above).
+        boot_max = np.empty(B)
+        R = np.array(remaining)
+        orig_mean = D[R].mean(axis=1, keepdims=True)
+        for b in range(B):
+            samp = D[R][:, idx[b]] - orig_mean
+            vals = np.array([_tstat(samp[j]) for j in range(len(R))])
+            boot_max[b] = vals.max() if len(vals) else -np.inf
+        k0 = remaining[0]
+        p_k = float((boot_max >= t_obs[k0]).mean())
+        step_p = max(step_p, p_k)  # stepdown monotonicity
+        adj[k0] = round(min(step_p, 1.0), 4)
+        if step_p < alpha:
+            rej.append(k0)
+            remaining = remaining[1:]
+        else:
+            for k in remaining[1:]:
+                adj[k] = round(min(max(step_p, float((boot_max >= t_obs[k]).mean())), 1.0), 4)
+            break
+    return rej, adj
+
+
+def pbo_diagnostic(model_pnls, S=8):
+    """Probability of Backtest Overfitting (Bailey et al.) via CSCV.
+
+    Partition time into S blocks; all C(S, S/2) IS/OOS splits; PBO = fraction
+    where the IS-optimal model ranks below the OOS median. Returns
+    {"pbo": x, "n_splits": m} or {"pbo": None} when too few models/splits
+    to be informative (<10 models or <10 splits) — diagnostic only, never
+    a promotion block on its own.
+    """
+    Ms = [np.asarray(m[1:], dtype=np.float64) for m in model_pnls]
+    K = len(Ms)
+    if K < 2:
+        return {"pbo": None, "reason": "need >= 2 models"}
+    n = min(len(m) for m in Ms)
+    Ms = [m[-n:] for m in Ms]
+    blocks = np.array_split(np.arange(n), S)
+    blocks = [b for b in blocks if len(b) >= 10]
+    if len(blocks) < 4:
+        return {"pbo": None, "reason": "splits too short"}
+    Sb = len(blocks)
+    splits = list(combinations(range(Sb), Sb // 2))
+    if len(splits) < 10:
+        return {"pbo": None, "reason": "fewer than 10 splits"}
+    below = 0
+    for iso in splits:
+        oos = [b for b in range(Sb) if b not in iso]
+        is_idx = np.concatenate([blocks[b] for b in iso])
+        oo_idx = np.concatenate([blocks[b] for b in oos])
+        is_sr = [float(Ms[k][is_idx].mean() / max(Ms[k][is_idx].std(ddof=1), 1e-12)) for k in range(K)]
+        oo_sr = [float(Ms[k][oo_idx].mean() / max(Ms[k][oo_idx].std(ddof=1), 1e-12)) for k in range(K)]
+        best = int(np.argmax(is_sr))
+        med = float(np.median(oo_sr))
+        if oo_sr[best] < med:
+            below += 1
+    return {"pbo": round(below / len(splits), 4), "n_splits": len(splits)}
+
+
+def portfolio_screen(candidate_pnl, peer_pnls, alpha_fw=0.05, B=500,
+                     benchmark_pnl=None):
+    """Promotion-time portfolio gate: candidate + peers vs benchmark with
+    Romano-Wolf FWER control. Returns (pass: bool, detail: dict).
+
+    pass requires the candidate (index 0) to be in the StepM rejection set
+    at `alpha_fw`. Peers should be the strongest alternatives (e.g. top-5
+    refs by Sharpe) so the adjustment prices real competition, not strawmen.
+    PBO is attached as info (informative only below ~10 models).
+    """
+    models = [candidate_pnl] + list(peer_pnls)
+    rej, adj = romano_wolf_stepm(models, benchmark_pnl, alpha_fw, B)
+    pbo = pbo_diagnostic(models)
+    ok = 0 in rej
+    return ok, {"candidate_adj_p": adj[0] if adj else 1.0,
+                "n_models": len(models), "alpha_fw": alpha_fw,
+                "rejected_idx": rej, "pbo": pbo}
