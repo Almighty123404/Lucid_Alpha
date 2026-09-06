@@ -1,10 +1,12 @@
+import json
 import numpy as np
+import os
 
 from fastexpr import (parse, to_expr, WQError, field_names, backfilled_fields, has_division,
                       bump_windows, add_backfill, swap_fields, wrap_ts_rank, wrap_decay,
                       wrap_group_neutralize, wrap_ts_delta, contains_group_neutralize,
                       wrap_trade_when, wrap_hump, wrap_truncate, wrap_regression_neut,
-                      iter_nodes, Call, Bin, Field, Num, Env, eval_node, eval_program)
+                      iter_nodes, Call, Bin, Neg, Field, Num, Assign, Env, eval_node, eval_program)
 from simulator import simulate, failed_criteria
 
 SPARSE_TOKENS = ('nws', 'snt', 'buzz', 'news', 'implied_volatility', 'est')
@@ -25,6 +27,247 @@ class Idea:
         self.name = name
         self.expr = expr
         self.rationale = rationale
+
+
+# ---------------------------------------------------------------------------
+# Audit 2026-09-06, Phase A (items 6/7/3 of the 14-remainder):
+# A1 fingerprint/skeleton novelty gate (ports wq-alpha-agent fingerprint idea):
+# A2 dimensional-consistency table (Alpha-squared-style pruning);
+# A3 parsimony score (GP/AlphaAgent practice: prefer shallower on ties).
+# ---------------------------------------------------------------------------
+
+def _skel(node):
+    if isinstance(node, Num):
+        return '#'
+    if isinstance(node, Field):
+        return 'F'
+    if isinstance(node, Neg):
+        return '(-' + _skel(node.x) + ')'
+    if isinstance(node, Bin):
+        return '(' + _skel(node.l) + node.op + _skel(node.r) + ')'
+    if isinstance(node, Call):
+        return node.name + '(' + ','.join(_skel(a) for a in node.args) + ')'
+    return '?'
+
+
+def skeleton_of(expr_str):
+    """Normalized structural skeleton: numbers -> #, fields -> F.
+
+    Catches param-only duplicates (same skeleton, different literals/fields)
+    that exact-string tried-sets miss. Returns None if unparseable.
+    """
+    try:
+        return _skel(parse(expr_str))
+    except WQError:
+        return None
+
+
+def window_tuple(expr_str):
+    """Sorted int literals in the expression (param vector for dup detection)."""
+    try:
+        node = parse(expr_str)
+    except WQError:
+        return ()
+    out = []
+    for n in iter_nodes(node):
+        if isinstance(n, Num) and isinstance(n.v, int):
+            out.append(n.v)
+    return tuple(sorted(out))
+
+
+def node_count(expr_str):
+    """AST size (parsimony score: fewer nodes = simpler). -1 if unparseable."""
+    try:
+        return sum(1 for _ in iter_nodes(parse(expr_str)))
+    except WQError:
+        return -1
+
+
+# Phase B7: hypothesis-leg alignment scoring (AlphaAgent-style, rule-based v1).
+# Advisory only: fraction of identifiable legs whose data family is named in
+# the hypothesis text. Families inferred from field tokens per leg.
+ALIGN_KEYWORDS = {
+    'sentiment': ('sentiment', 'news', 'buzz', 'media', 'attention', 'nws', 'story', 'headline'),
+    'fundamental': ('earning', 'ebitda', 'margin', 'profit', 'sales', 'revenue',
+                    'leverage', 'debt', 'quality', 'fundamental', 'cash', 'asset',
+                    'estimate', 'revision', 'analyst'),
+    'microstructure': ('reversal', 'volume', 'liquidity', 'microstructure', 'turnover',
+                       'mean-reversion', 'mean reversion', 'short-term', 'loser', 'bounce'),
+    'derivatives': ('option', 'iv ', 'iv-', 'skew', 'put', 'call', 'fear', 'crash',
+                    'volatility', 'vol ', 'implied', 'derivative'),
+    'momentum': ('momentum', 'trend', 'drift', 'persistence', 'continuation'),
+}
+FIELD_FAMILY_TOKENS = {
+    'sentiment': ('nws', 'snt', 'buzz', 'news'),
+    'fundamental': ('ebitda', 'sales', 'debt', 'assets', 'liabilit', 'est'),
+    'microstructure': ('returns', 'close', 'open', 'high', 'low', 'volume', 'adv20', 'cap'),
+    'derivatives': ('implied_volatility',),
+}
+
+
+def _leg_family(leg_expr):
+    try:
+        names = {n.name for n in iter_nodes(parse(leg_expr)) if isinstance(n, Field)}
+    except WQError:
+        return None
+    scores = {}
+    for fam, toks in FIELD_FAMILY_TOKENS.items():
+        hit = sum(1 for nm in names for t in toks if t in nm)
+        if hit:
+            scores[fam] = hit
+    if not scores:
+        return None
+    return max(scores, key=lambda f: scores[f])
+
+
+def alignment_score(hypothesis, leg_exprs):
+    """Fraction of identifiable legs covered by the hypothesis (None if none).
+
+    Advisory metric only — never gates. A low score means the story does not
+    name the data it trades; a high score does not mean the story is true.
+    """
+    hy = (hypothesis or '').lower()
+    fams = [_leg_family(le) for le in leg_exprs]
+    fams = [f for f in fams if f is not None]
+    if not fams:
+        return None
+    hit = sum(1 for f in fams
+              if any(kw in hy for kw in ALIGN_KEYWORDS.get(f, (f,))))
+    return round(hit / len(fams), 3)
+
+
+def template_family_balance(templates, seed=0):
+    """Count data families across one sampled instance per template.
+
+    Advisory (ChenNachuan field-sampling balancer): when the pool exceeds ~20
+    templates, price-volume families tend to dominate search; balance with
+    Log+MinMax+Softmax sampling. Below that threshold the balancer stays
+    dormant — reported, not enforced.
+    """
+    import numpy as _np
+    rng = _np.random.default_rng(seed)
+    counts = {}
+    for name, builder, rationale in templates:
+        try:
+            expr = builder(rng)
+        except TypeError:
+            expr = builder
+        fam = _leg_family(expr) or 'unknown'
+        counts[fam] = counts.get(fam, 0) + 1
+    total = sum(counts.values())
+    return {'counts': counts, 'total': total,
+            'balancer': 'active' if total > 20 else 'dormant (<=20 templates)'}
+
+
+# Dimensional classes: CCY (money-like), COUNT (shares/volume), LESS
+# (dimensionless: returns, scores, vols, ratios), GROUP (sector/industry maps),
+# VECTOR (news-vector fields), BOOL (comparisons), DERIVED (products/ratios).
+DIMENSIONS = {
+    'open': 'CCY', 'high': 'CCY', 'low': 'CCY', 'close': 'CCY',
+    'ebitda': 'CCY', 'sales': 'CCY', 'debt': 'CCY', 'assets': 'CCY',
+    'liabilities_curr': 'CCY', 'assets_curr': 'CCY', 'cap': 'CCY', 'adv20': 'CCY',
+    'volume': 'COUNT',
+    'returns': 'LESS', 'buzz': 'LESS',
+    'implied_volatility_call_10': 'LESS', 'implied_volatility_call_60': 'LESS',
+    'implied_volatility_put_10': 'LESS', 'implied_volatility_put_60': 'LESS',
+    'nws12_afterhsz_01l': 'VECTOR', 'nan': 'LESS',
+    'sector': 'GROUP', 'industry': 'GROUP', 'subindustry': 'GROUP',
+    'country': 'GROUP', 'exchange': 'GROUP',
+}
+
+_LESS_OUT = {'rank', 'quantile', 'zscore', 'normalize', 'winsorize', 'scale',
+             'ts_zscore', 'ts_rank', 'ts_covariance', 'ts_corr', 'ts_regression',
+             'group_rank', 'group_zscore', 'group_scale', 'bucket', 'densify',
+             'ts_count_nans', 'ts_arg_max', 'ts_arg_min', 'days_from_last_change',
+             'kth_element', 'last_diff_value', 'is_nan', 'not'}
+_ADD_SUB = {'add', 'subtract'}
+
+
+def _dim_of(node, scope=()):
+    if isinstance(node, Num):
+        return 'NUM'
+    if isinstance(node, Field):
+        if node.name in scope:
+            return 'LESS'
+        return DIMENSIONS.get(node.name, 'LESS')
+    if isinstance(node, Neg):
+        return _dim_of(node.x, scope)
+    if isinstance(node, Bin):
+        if node.op in ('+', '-'):
+            dl, dr = _dim_of(node.l, scope), _dim_of(node.r, scope)
+            if 'NUM' in (dl, dr):
+                return dl if dr == 'NUM' else dr
+            if dl != dr:
+                raise WQError(f"dimension mismatch: {dl} {node.op} {dr}")
+            return dl
+        if node.op in ('<', '>', '<=', '>=', '==', '!='):
+            return 'BOOL'
+        if node.op in ('&', '|'):
+            return 'BOOL'
+        return 'DERIVED'
+    if isinstance(node, Call):
+        if node.name in _LESS_OUT:
+            for a in node.args:  # still type-check args (catches rank(close+volume))
+                _dim_of(a, scope)
+            return 'LESS'
+        if node.name in ('ts_mean', 'ts_std_dev', 'ts_sum', 'ts_product',
+                         'ts_decay_linear', 'ts_delay', 'ts_backfill', 'ts_scale',
+                         'ts_av_diff', 'ts_quantile', 'group_mean', 'group_backfill',
+                         'abs', 'log', 'sign', 'sqrt', 'hump', 'truncate',
+                         'inverse', 'reverse', 'signed_power', 'max', 'min',
+                         'add', 'subtract', 'divide', 'multiply', 'power'):
+            if node.name in _ADD_SUB or (node.name in ('max', 'min') and len(node.args) == 2):
+                ds = [_dim_of(a, scope) for a in node.args[:2]]
+                ds = [d for d in ds if d != 'NUM']
+                if len(ds) == 2 and ds[0] != ds[1] and 'DERIVED' not in ds and 'BOOL' not in ds:
+                    raise WQError(f"dimension mismatch in {node.name}: {ds[0]} vs {ds[1]}")
+            if node.name in ('vec_avg', 'vec_sum', 'vec_max', 'vec_min'):
+                for a in node.args:
+                    if _dim_of(a, scope) != 'VECTOR':
+                        raise WQError(f"{node.name} expects a Vector field")
+                return 'LESS'
+            if node.name == 'group_neutralize' and len(node.args) >= 2:
+                if _dim_of(node.args[1], scope) != 'GROUP':
+                    raise WQError("group_neutralize expects a Group field")
+            if node.name in ('trade_when', 'if_else'):
+                if node.args and _dim_of(node.args[0], scope) not in ('BOOL', 'LESS', 'NUM'):
+                    raise WQError(f"{node.name} condition must be boolean-like")
+            inner = [_dim_of(a, scope) for a in node.args if not isinstance(a, Num)]
+            inner = [d for d in inner if d not in ('GROUP', 'BOOL')]
+            return inner[0] if inner else 'LESS'
+        if node.name == 'group_neutralize' and len(node.args) >= 2:
+            if _dim_of(node.args[1], scope) != 'GROUP':
+                raise WQError("group_neutralize expects a Group field")
+            return _dim_of(node.args[0], scope)
+        if node.name in ('trade_when', 'if_else') and node.args:
+            if _dim_of(node.args[0], scope) not in ('BOOL', 'LESS', 'NUM'):
+                raise WQError(f"{node.name} condition must be boolean-like")
+            return 'LESS'
+        if node.name in ('vec_avg', 'vec_sum', 'vec_max', 'vec_min'):
+            for a in node.args:
+                if _dim_of(a, scope) != 'VECTOR':
+                    raise WQError(f"{node.name} expects a Vector field")
+            return 'LESS'
+        return 'DERIVED'
+    return 'LESS'
+
+
+def dimension_check(expr_str):
+    """Return list of dimensional violations ([] = clean, None = unchecked).
+
+    Only additive (+/-) mismatches and group/vector misplacements are checked;
+    products/ratios/comparisons are free (they produce derived/boolean dims).
+    Lenient by design: unknown fields default to dimensionless.
+    """
+    try:
+        node = parse(expr_str)
+    except WQError:
+        return None
+    try:
+        _dim_of(node)
+    except WQError as e:
+        return [str(e)]
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -255,11 +498,14 @@ def _mini(rep):
             f"corr={rep['criteria']['self_correlation']['value']:.2f}")
 
 
-def _score(rep):
+def _score(rep, expr=None):
+    # Audit Phase A3: 4th element prefers shallower ASTs on exact ties
+    # (parsimony pressure against bloat; GP/AlphaAgent practice).
     if rep.get('error'):
-        return (-1, -1.0, -1.0)
+        return (-1, -1.0, -1.0, 0)
+    nodes = -node_count(expr) if expr else 0
     return (sum(1 for c in rep['criteria'].values() if c['pass']),
-            rep['metrics']['fitness'], rep['metrics']['sharpe'])
+            rep['metrics']['fitness'], rep['metrics']['sharpe'], nodes)
 
 
 class Optimizer:
@@ -267,6 +513,33 @@ class Optimizer:
         self.name = name
         self.role = role
         self.specialty = specialty
+
+    @staticmethod
+    def _load_lessons():
+        """Phase B6: dead-end fix counts keyed (failed-gates, fix-action).
+
+        Written by Competition from failed rounds (reports/lessons.jsonl).
+        Missing/corrupt file -> {} (safe default: no filtering).
+        """
+        out = {}
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            'reports', 'lessons.jsonl')
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        e = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not e.get('round_passed'):
+                        key = (tuple(e.get('failed', [])), e.get('fix', ''))
+                        out[key] = out.get(key, 0) + 1
+        except OSError:
+            pass
+        return out
 
     def optimize(self, idea, panel, refs, own_refs, max_iter, settings=None):
         log = []
@@ -278,7 +551,14 @@ class Optimizer:
 
         rep = simulate(to_expr(node), panel, refs, own_refs, settings=settings)
         log.append({'iteration': 0, 'action': f"evaluated raw idea '{idea.name}'", 'expr': to_expr(node),
-                    'metrics': _mini(rep), 'failed': failed_criteria(rep)})
+                    'metrics': _mini(rep), 'failed': failed_criteria(rep),
+                    'skeleton': skeleton_of(to_expr(node)), 'nodes': node_count(to_expr(node)),
+                    'dimensions': dimension_check(to_expr(node)),
+                    'alignment': alignment_score(idea.rationale, [to_expr(node)])})
+        dim0 = dimension_check(to_expr(node))
+        if dim0:
+            log.append({'iteration': 0,
+                        'action': f"dimension warning (advisory only, simulating anyway): {dim0}"})
 
         # Per-component diagnostic pass (mandatory before any combination is
         # kept). Decompose top-level add/sub/mul combos and diagnose each
@@ -315,7 +595,7 @@ class Optimizer:
                             'action': f"combined-vs-individual: {verdict}",
                             'metrics': _mini(rep), 'failed': failed_criteria(rep),
                             'comparison': rows})
-                if not best_leg['rep'].get('error') and _score(best_leg['rep']) >= _score(rep):
+                if not best_leg['rep'].get('error') and _score(best_leg['rep'], best_leg['expr']) >= _score(rep, to_expr(node)):
                     log.append({'iteration': 0,
                                 'action': (f"subtraction preferred: best leg '{best_leg['expr'][:60]}' "
                                            f"scores >= combined; reverting to smaller subset"),
@@ -333,6 +613,8 @@ class Optimizer:
                         'component_coverage': d.get('coverage', {})})
 
         tried = {to_expr(node)}
+        tried_skeletons = {(skeleton_of(to_expr(node)), window_tuple(to_expr(node)))}
+        lessons = self._load_lessons()  # Phase B6: skip repeatedly dead-ended fixes
         best_expr, best_rep = to_expr(node), rep
         last_expr, last_rep = to_expr(node), rep
         diagnosis_counts = {}
@@ -341,14 +623,37 @@ class Optimizer:
         for i in range(1, max_iter + 1):
             if rep.get('passed') or rep.get('error'):
                 break
+            failed_now = tuple(sorted(failed_criteria(rep)))
             chosen = None
             for f in self._fix_candidates(rep, node):
                 if f.get('discouraged'):
                     log.append({'iteration': i, 'rejected_discouraged_pattern': f['action']})
                     continue
+                if lessons.get((failed_now, f.get('action', '')), 0) >= 3:
+                    log.append({'iteration': i,
+                                'rejected_lesson': f"{f['action'][:80]} "
+                                                   f"(dead-ended {lessons[(failed_now, f.get('action', ''))]}x "
+                                                   f"on {list(failed_now)})"})
+                    continue
                 cand = f['node']
                 sig = to_expr(cand)
                 if sig in tried:
+                    continue
+                # Phase A1: skeleton gate — skip param-only re-sims of an
+                # already-simulated (structure, window-vector) pair. Genuine
+                # window changes always pass (new vector); only exact
+                # structural repeats are blocked.
+                skey = (skeleton_of(sig), window_tuple(sig))
+                if skey in tried_skeletons:
+                    log.append({'iteration': i, 'rejected_skeleton_duplicate': sig[:80]})
+                    continue
+                # Phase A2: dimensional gate — reject incoherent candidates
+                # pre-simulate (Alpha-squared-style pruning). Verified clean
+                # on all 13 team templates before enforcing.
+                dimv = dimension_check(sig)
+                if dimv:
+                    log.append({'iteration': i, 'rejected_dimension_violation': dimv,
+                                'expr': sig[:80]})
                     continue
                 chosen = f
                 break
@@ -358,14 +663,15 @@ class Optimizer:
                 break
             new_expr = to_expr(chosen['node'])
             tried.add(new_expr)
+            tried_skeletons.add((skeleton_of(new_expr), window_tuple(new_expr)))
             node = chosen['node']
             rep = simulate(new_expr, panel, refs, own_refs, settings=settings)
             cur_sig = _mini(rep)
             entry = {'iteration': i, 'diagnosis': chosen['diagnosis'], 'hypothesis': chosen['hypothesis'],
                      'fix': chosen['action'], 'new_expr': new_expr, 'metrics': cur_sig,
-                     'failed': failed_criteria(rep)}
+                     'failed': failed_criteria(rep), 'nodes': node_count(new_expr)}
             log.append(entry)
-            if _score(rep) > _score(best_rep):
+            if _score(rep, new_expr) > _score(best_rep, best_expr):
                 best_expr, best_rep = new_expr, rep
             last_expr, last_rep = new_expr, rep
 
@@ -382,7 +688,7 @@ class Optimizer:
 
         final_expr = last_expr
         final_rep = last_rep
-        if _score(best_rep) > _score(last_rep) and best_rep.get('passed') and not last_rep.get('passed'):
+        if _score(best_rep, best_expr) > _score(last_rep, last_expr) and best_rep.get('passed') and not last_rep.get('passed'):
             final_expr, final_rep = best_expr, best_rep
 
         return final_expr, final_rep, log
@@ -463,12 +769,12 @@ class Optimizer:
         if 'subuniverse_sharpe' in failed:
             if not contains_group_neutralize(node):
                 fixes.append({
-                    'diagnosis': f"Sub-universe Sharpe {rep['criteria']['subuniverse_sharpe']['value']:.2f} below 0.80 while full-universe Sharpe is {rep['metrics']['sharpe']:.2f}",
+                    'diagnosis': f"Sub-universe Sharpe {rep['criteria']['subuniverse_sharpe']['value']:.2f} below cutoff {rep.get('subuniverse_cutoff', '?')} (S1 0.75-relative) while full-universe Sharpe is {rep['metrics']['sharpe']:.2f}",
                     'hypothesis': "Edge is concentrated in illiquid names or sector bets dominate the liquid subset; industry-neutralization isolates the stock-level signal",
                     'action': "wrapped signal in group_neutralize(..., industry)",
                     'node': wrap_group_neutralize(node)})
             fixes.append({
-                'diagnosis': f"Sub-universe Sharpe {rep['criteria']['subuniverse_sharpe']['value']:.2f} below 0.80",
+                    'diagnosis': f"Sub-universe Sharpe {rep['criteria']['subuniverse_sharpe']['value']:.2f} below cutoff {rep.get('subuniverse_cutoff', '?')} (S1 0.75-relative)",
                 'hypothesis': "Fast noisy signals degrade in the liquid subset where pricing is efficient; longer windows de-noise",
                 'action': "doubled all time-series windows",
                 'node': bump_windows(node, 2.0)})

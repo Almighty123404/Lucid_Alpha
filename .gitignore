@@ -7,3 +7,8 @@ cache/*.pkl
 # Regenerable competition outputs (re-run run.py to reproduce)
 reports/round_*.json
 reports/leaderboard.json
+reports/lessons.jsonl
+reports/walkforward.json
+reports/runs.jsonl
+reports/trials.jsonl
+reports/gp_campaign.json

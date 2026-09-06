@@ -1,2 +1,6 @@
-numpy>=1.24
-yfinance>=0.2.40  # only needed for run.py --real (real market data via real_data.py)
+numpy==2.2.6
+yfinance==0.2.65  # only needed for run.py --real (real market data via real_data.py)
+pytest==9.1.1  # test suite (tests/); synthetic-only, no network required
+numba==0.62.1  # Phase 2 execution kernels (kernels.py); numpy fallback if absent
+llvmlite==0.45.1  # numba backend pin
+duckdb==1.5.5  # Phase 4 PIT engine (pit.py revision logs + leak-free lookup)

@@ -4,7 +4,7 @@ import pickle
 import numpy as np
 import yfinance as yf
 
-from data_gen import Panel, _roll_mean, _roll_std, _cs_z, _rank1d, _blackout_masks
+from data_gen import Panel, _roll_mean, _roll_std, _cs_z, _rank1d, _blackout_masks, validate_panel, fingerprint_panel
 
 
 DEFAULT_TICKERS = [
@@ -196,15 +196,25 @@ def generate_real_panel(seed=7, n_stocks=200, start="2020-01-01", end="2022-12-3
     debt_q = assets_q * lev[None, :]
     curr_a = rng.uniform(0.25, 0.5, N)
     liab_c = rng.uniform(0.08, 0.3, N)
-    qidx = np.minimum(np.arange(T) // 63, nq - 1)
 
-    def _expand(aq):
-        return aq[qidx, :]
-
-    sales = _expand(sales_q)
-    ebitda = sales * _expand(margin_q)
-    assets = _expand(assets_q)
-    debt = _expand(debt_q)
+    # Phase 4 PIT (mirrors data_gen): overlays are synthetic, so they get the
+    # same knowledge-bounded serving (20-45d lag + 2% restatements) rather
+    # than zero-lag forward-fill. ebitda uses PIT margin for consistency.
+    from pit import build_revision_log as _brl, pit_asof_multi as _am, validate_pit as _vpit
+    _pe = np.array([dates[min((q + 1) * 63 - 1, T - 1)] for q in range(nq)])
+    _pit4 = _am({"sales": _brl(_pe, sales_q, "sales", rng),
+                 "margin": _brl(_pe, margin_q, "margin", rng),
+                 "assets": _brl(_pe, assets_q, "assets", rng),
+                 "debt": _brl(_pe, debt_q, "debt", rng)}, dates)
+    sales, _skn = _pit4["sales"]
+    _marg_pit, _mkn = _pit4["margin"]
+    assets, _akn = _pit4["assets"]
+    debt, _dkn = _pit4["debt"]
+    _vpit(sales, _skn, dates)
+    _vpit(_marg_pit, _mkn, dates)
+    _vpit(assets, _akn, dates)
+    _vpit(debt, _dkn, dates)
+    ebitda = sales * _marg_pit
     assets_curr = assets * curr_a[None, :]
     liabilities_curr = assets * liab_c[None, :]
 
@@ -216,10 +226,12 @@ def generate_real_panel(seed=7, n_stocks=200, start="2020-01-01", end="2022-12-3
         s = phi * s + innov_scale * rng.normal(0.0, 1.0, N)
         sent_latent[t] = s
     sent_z = np.nan_to_num(_cs_z(sent_latent), nan=0.0)
-    p_cov = 0.25 + 0.5 * liq_rank[None, :]
-    sent_black = _blackout_masks(rng, T, 1, 0.015, 0.01, 18)
+    # Same sparsity recalibration as data_gen.py 2026-09-06 (Bug: sentiment
+    # overlays printed ~47%; real nws12 prints ~1-5%).
+    p_cov = 0.02 + 0.10 * liq_rank[None, :] ** 2
+    sent_black = _blackout_masks(rng, T, 1, 0.03, 0.01, 30)
     in_black = sent_black[:, None]
-    sent_cov = (rng.random((T, N)) < p_cov) & (~in_black | (rng.random((T, N)) < 0.03))
+    sent_cov = (rng.random((T, N)) < p_cov) & (~in_black | (rng.random((T, N)) < 0.01))
     jumps = np.where(rng.random((T, N)) < 0.002, rng.choice([-1.0, 1.0], (T, N)) * rng.uniform(3.0, 7.0, (T, N)), 0.0)
     sent_obs = np.where(sent_cov, sent_z * 0.9 + rng.normal(0.0, 0.5, (T, N)) + jumps, np.nan)
     vec_parts = [np.where(sent_cov, sent_obs + rng.normal(0.0, 0.35, (T, N)), np.nan) for _ in range(3)]
@@ -241,4 +253,7 @@ def generate_real_panel(seed=7, n_stocks=200, start="2020-01-01", end="2022-12-3
 
     panel = Panel(dates=dates, fields=fields, vector_fields=vector_fields, groups=groups, subuniverse=subuniverse)
     panel.tickers = kept
+    validate_panel(panel)  # Phase 2: fail loudly on malformed panels
+    panel.dataset_id = fingerprint_panel(dates, fields, vector_fields, backend="yfinance",
+                                         tickers=kept, start=str(start), end=str(end), seed=seed)
     return panel

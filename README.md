@@ -20,7 +20,12 @@ python run.py 3 --real
 python run.py 3 --settings my_settings.json
 ```
 
-Reports land in `reports/` (`round_<k>.json`, `leaderboard.json`).
+Reports land in `reports/` (`round_<k>.json`, `leaderboard.json`, `runs.jsonl` manifest, `lessons.jsonl`).
+
+```bash
+pip install -r requirements.txt
+python -m pytest tests/ -q   # 24 fast checks, synthetic-only, no network
+```
 
 > Pipeline notes (WorldQuant Brain-compatible simulation engine):
 > - `simulate(expression, settings)` with `settings` matching the
@@ -39,10 +44,14 @@ Reports land in `reports/` (`round_<k>.json`, `leaderboard.json`).
 |---|---|
 | `config.py` | Versioned `SimulationSettings` schema (region/universe/delay/decay/truncation/neutralization/pasteurization/nanHandling/unitHandling) + all cutoffs/formula constants (SOURCED vs APPROX-marked), overridable per `simulate()` call |
 | `fastexpr.py` | Expression parser + evaluator: multi-statement `;` scripts with locals, cross-sectional (`rank`, `zscore`, `quantile` with uniform/gaussian/cauchy drivers, `scale`, `bucket`), time-series (`ts_mean`, `ts_decay_linear`, `ts_delta`, `ts_zscore`, `ts_rank`, …), group (`group_neutralize`, `group_vector_neut`, …), vector (`vec_avg`, `vec_sum`, `vec_max`, `vec_min`), `vector_neut`, trading (`trade_when`, `hump`, `truncate`), unit VERIFY/OFF |
-| `data_gen.py` | Synthetic panel generator (seeded, with regime switches; tenor-graded options coverage, quarterly fundamentals, skewed news coverage) |
+| `data_gen.py` | Synthetic panel generator (seeded; GJR-GARCH-t + dated stress/bear + portable panic gate; PIT-served quarterly fundamentals; tenor-graded options coverage; sparse news; ~2%/yr delistings; `validate_panel` gate) |
+| `pit.py` | Bi-temporal revision logs + DuckDB leak-free lookup (`build_revision_log`, `pit_asof`, `validate_pit`) |
+| `gp.py` | Grammar-constrained GP candidate generator (proposes only; gates dispose) + Pareto hall-of-fame |
+| `selection.py` | Trial registry + Bailey-LP Deflated Sharpe + promotion block (DSR < threshold or missing lineage ⇒ blocked) |
+| `kernels.py` | Numba execution kernels (universe top-N) with numpy fallback |
 | `real_data.py` | Real OHLCV panel via yfinance (+ synthetic IV/sentiment overlays) |
 | `providers.py` | Pluggable `DataProvider` interface (`synthetic` / `real` backends, coverage audit) |
-| `simulator.py` | Backtester pipeline (parse → evaluate → universe/pasteurization → neutralization → decay → truncation → delay → book normalize → PnL): Sharpe, Fitness, Turnover, Returns (invested = book/2), Drawdown, Margin, concentration + top dates, sub-universe Sharpe (delay-0 formula), rolling-2Y self-correlation on daily changes, IS/TEST/OS + yearly long/short counts |
+| `simulator.py` | Backtester pipeline (parse → evaluate → universe/pasteurization → neutralization → decay → truncation → delay → book normalize → PnL): Sharpe, Fitness, Turnover, Returns (invested = book/2), Drawdown, Margin, concentration + top dates, sub-universe Sharpe (S1 0.75-relative formula, pasteurize→market-neutralize→rescale), rolling-4Y self-correlation on daily changes (+2Y info), IS/TEST/OS + yearly long/short counts |
 | `calibration.py` + `calibration/` | Living calibration log: schema + JSONL records pairing real Brain results with simulator predictions |
 | `agents.py` | Ideator/Optimizer teams + per-component diagnostic discipline (standalone test → hypothesis → justified combine → compare vs legs; subtraction before machinery) |
 | `competition.py` | Round runner, pass-only scoring (Fitness, then Sharpe), leaderboard |
@@ -53,8 +62,7 @@ Reports land in `reports/` (`round_<k>.json`, `leaderboard.json`).
 ## Submission cutoffs
 
 Sharpe > 1.25, Fitness > 1.0, Turnover 1–70%, weight concentration ≤ 10%,
-sub-universe Sharpe > 0.80, self-correlation < 0.7 (or Sharpe ≥ 1.10× the
-correlated reference). Only alphas passing **all** cutoffs score.
+sub-universe Sharpe above the S1 relative cutoff (0.75·√(sub/alpha)·alpha_Sharpe), self-correlation < 0.7 (4Y window, or Sharpe ≥ 1.10× EVERY correlated ref). Only alphas passing **all** cutoffs score.
 
 ## Notes
 

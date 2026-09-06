@@ -11,8 +11,9 @@
       "nanHandling": "ON", "unitHandling": "VERIFY",
       "language": "FASTEXPR", "instrumentType": "EQUITY"
     },
-    "real_metrics": {"sharpe": 1.31, "fitness": 1.05, "turnover_pct": 12.4, "returns_pct": 3.1, "margin_bps": 5.2, "weight_concentration_pct": 4.0, "subuniverse_sharpe": 0.9},
-    "predicted_metrics": {"sharpe": 2.30, "fitness": 1.59, "turnover_pct": 1.52, "returns_pct": 5.94, "margin_bps": 77.8, "weight_concentration_pct": 0.66, "subuniverse_sharpe": 1.9},
+    "real_metrics": {"sharpe": 1.31, "fitness": 1.05, "turnover_pct": 12.4, "returns_pct": 3.1, "margin_bps": 5.2, "weight_concentration_pct": 4.0, "subuniverse_sharpe": 0.9, "self_correlation": 0.12, "self_corr_ref": "ref_mom120"},
+    "predicted_metrics": {"sharpe": 2.30, "fitness": 1.59, "turnover_pct": 1.52, "returns_pct": 5.94, "margin_bps": 77.8, "weight_concentration_pct": 0.66, "subuniverse_sharpe": 1.9, "self_correlation": 0.08, "self_corr_ref": "ref_mom120"},
+    "notes": "simulator optimistic on turnover (decay) — recalibrate decay/turnover mapping. Audit 2026-09-06 (item 2): always capture subuniverse_sharpe + self_correlation (+ref) on both sides — all 4 Round-1 real pairs lack them, blocking gate rechecks."
     "notes": "simulator optimistic on turnover (decay) — recalibrate decay/turnover mapping"
   }
 }
