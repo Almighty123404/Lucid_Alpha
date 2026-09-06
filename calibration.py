@@ -151,24 +151,41 @@ def turnover_slope(pool=None, min_points=4, min_span=30.0):
 
 _FAMILY_TOKENS = {
     "sentiment": ("nws", "snt", "buzz", "news"),
-    "fundamental": ("ebitda", "sales", "debt", "assets", "margin", "lev", "est"),
-    "microstructure": ("returns", "close", "open", "high", "low", "volume", "adv20", "cap"),
-    "derivatives": ("implied_volatility",),
+    "fundamental": ("ebitda", "sales", "debt", "assets", "margin", "lev", "est",
+                    "cogs", "gross_profit", "income", "eps", "equity",
+                    "cash", "retained", "goodwill", "working_capital",
+                    "capex", "dividends", "tax", "revenue", "fcf",
+                    "ocf", "analyst", "recommendation", "surprise", "segment"),
+    "microstructure": ("returns", "close", "open", "high", "low", "volume", "adv20", "cap",
+                       "vwap", "shares_out", "short_interest", "days_to_cover",
+                       "borrow_fee", "insider", "intraday"),
+    "derivatives": ("implied_volatility", "iv_", "hv_", "put_call", "opt_open",
+                    "skew", "option"),
 }
 
 
 def family_of_expression(expr):
-    """Majority-vote data family from field tokens (ties -> mixed)."""
+    """Majority-vote data family from field tokens (ties -> mixed).
+
+    Longest-match voting per field (see agents._leg_family): prevents
+    substring collisions ('cap' ⊂ 'capex', 'open' ⊂ 'opt_open_interest').
+    """
     from fastexpr import parse, iter_nodes, Field, WQError
     try:
         names = {n.name for n in iter_nodes(parse(expr)) if isinstance(n, Field)}
     except WQError:
         return "unknown"
     scores = {}
-    for fam, toks in _FAMILY_TOKENS.items():
-        hit = sum(1 for nm in names for t in toks if t in nm)
-        if hit:
-            scores[fam] = hit
+    for nm in names:
+        best, bestlen = [], -1
+        for fam, toks in _FAMILY_TOKENS.items():
+            ml = max((len(t) for t in toks if t in nm), default=-1)
+            if ml > bestlen:
+                best, bestlen = [fam], ml
+            elif ml == bestlen and ml >= 0:
+                best.append(fam)
+        for fam in best:
+            scores[fam] = scores.get(fam, 0) + 1
     if not scores:
         return "unknown"
     top = max(scores.values())

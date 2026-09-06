@@ -99,22 +99,38 @@ ALIGN_KEYWORDS = {
 }
 FIELD_FAMILY_TOKENS = {
     'sentiment': ('nws', 'snt', 'buzz', 'news'),
-    'fundamental': ('ebitda', 'sales', 'debt', 'assets', 'liabilit', 'est'),
-    'microstructure': ('returns', 'close', 'open', 'high', 'low', 'volume', 'adv20', 'cap'),
-    'derivatives': ('implied_volatility',),
+    'fundamental': ('ebitda', 'sales', 'debt', 'assets', 'liabilit', 'est',
+                    'cogs', 'gross_profit', 'income', 'eps', 'equity',
+                    'cash', 'retained', 'goodwill', 'working_capital',
+                    'capex', 'dividends', 'tax', 'margin', 'revenue', 'fcf',
+                    'ocf', 'analyst', 'recommendation', 'surprise', 'segment'),
+    'microstructure': ('returns', 'close', 'open', 'high', 'low', 'volume', 'adv20', 'cap',
+                       'vwap', 'shares_out', 'short_interest', 'days_to_cover',
+                       'borrow_fee', 'insider', 'intraday'),
+    'derivatives': ('implied_volatility', 'iv_', 'hv_', 'put_call', 'opt_open',
+                    'skew', 'option'),
 }
 
 
 def _leg_family(leg_expr):
+    # Longest-match voting: each field votes once, for the family owning its
+    # longest matching token. Prevents substring collisions ('cap' ⊂ 'capex',
+    # 'open' ⊂ 'opt_open_interest') from double-counting across families.
     try:
         names = {n.name for n in iter_nodes(parse(leg_expr)) if isinstance(n, Field)}
     except WQError:
         return None
     scores = {}
-    for fam, toks in FIELD_FAMILY_TOKENS.items():
-        hit = sum(1 for nm in names for t in toks if t in nm)
-        if hit:
-            scores[fam] = hit
+    for nm in names:
+        best, bestlen = [], -1
+        for fam, toks in FIELD_FAMILY_TOKENS.items():
+            ml = max((len(t) for t in toks if t in nm), default=-1)
+            if ml > bestlen:
+                best, bestlen = [fam], ml
+            elif ml == bestlen and ml >= 0:
+                best.append(fam)
+        for fam in best:
+            scores[fam] = scores.get(fam, 0) + 1
     if not scores:
         return None
     return max(scores, key=lambda f: scores[f])
@@ -168,11 +184,27 @@ DIMENSIONS = {
     'liabilities_curr': 'CCY', 'assets_curr': 'CCY', 'cap': 'CCY', 'adv20': 'CCY',
     'volume': 'COUNT',
     'returns': 'LESS', 'buzz': 'LESS',
+    'vwap': 'CCY', 'shares_out': 'COUNT', 'adv60': 'CCY',
+    'cogs': 'CCY', 'gross_profit': 'CCY', 'operating_income': 'CCY',
+    'net_income': 'CCY', 'eps': 'CCY', 'tax_expense': 'CCY', 'liabilities': 'CCY',
+    'equity': 'CCY', 'cash_and_equiv': 'CCY', 'retained_earnings': 'CCY',
+    'goodwill': 'CCY', 'working_capital': 'CCY', 'operating_cash_flow': 'CCY',
+    'capex': 'CCY', 'free_cash_flow': 'CCY', 'dividends_paid': 'CCY',
+    'est_eps': 'CCY', 'est_revenue': 'CCY', 'est_eps_std': 'CCY',
+    'recommendation': 'LESS', 'eps_surprise': 'LESS',
+    'snt_news': 'LESS', 'snt_social': 'LESS', 'news_volume': 'COUNT',
+    'iv_10': 'LESS', 'iv_30': 'LESS', 'hv_20': 'LESS', 'put_call_ratio': 'LESS',
+    'opt_open_interest': 'COUNT', 'short_interest': 'COUNT',
+    'days_to_cover': 'LESS', 'borrow_fee': 'LESS',
+    'insider_buying': 'CCY', 'insider_selling': 'CCY',
     'implied_volatility_call_10': 'LESS', 'implied_volatility_call_60': 'LESS',
     'implied_volatility_put_10': 'LESS', 'implied_volatility_put_60': 'LESS',
     'nws12_afterhsz_01l': 'VECTOR', 'nan': 'LESS',
     'sector': 'GROUP', 'industry': 'GROUP', 'subindustry': 'GROUP',
-    'country': 'GROUP', 'exchange': 'GROUP',
+    'country': 'GROUP', 'exchange': 'GROUP', 'market': 'GROUP',
+    'nws12_afterhsz_01l': 'VECTOR', 'analyst_eps_estimates': 'VECTOR',
+    'option_implied_vol_surface': 'VECTOR', 'segment_revenue': 'VECTOR',
+    'price_volume_intraday': 'VECTOR',
 }
 
 _LESS_OUT = {'rank', 'quantile', 'zscore', 'normalize', 'winsorize', 'scale',
@@ -221,7 +253,7 @@ def _dim_of(node, scope=()):
                 ds = [d for d in ds if d != 'NUM']
                 if len(ds) == 2 and ds[0] != ds[1] and 'DERIVED' not in ds and 'BOOL' not in ds:
                     raise WQError(f"dimension mismatch in {node.name}: {ds[0]} vs {ds[1]}")
-            if node.name in ('vec_avg', 'vec_sum', 'vec_max', 'vec_min'):
+            if node.name in ('vec_avg', 'vec_mean', 'vec_sum', 'vec_max', 'vec_min', 'vec_std'):
                 for a in node.args:
                     if _dim_of(a, scope) != 'VECTOR':
                         raise WQError(f"{node.name} expects a Vector field")
@@ -243,10 +275,14 @@ def _dim_of(node, scope=()):
             if _dim_of(node.args[0], scope) not in ('BOOL', 'LESS', 'NUM'):
                 raise WQError(f"{node.name} condition must be boolean-like")
             return 'LESS'
-        if node.name in ('vec_avg', 'vec_sum', 'vec_max', 'vec_min'):
+        if node.name in ('vec_avg', 'vec_mean', 'vec_sum', 'vec_max', 'vec_min', 'vec_std'):
             for a in node.args:
                 if _dim_of(a, scope) != 'VECTOR':
                     raise WQError(f"{node.name} expects a Vector field")
+            return 'LESS'
+        if node.name == 'vec_choose' and node.args:
+            if _dim_of(node.args[0], scope) != 'VECTOR':
+                raise WQError("vec_choose expects a Vector field as first arg")
             return 'LESS'
         for a in node.args:  # unknown ops: still validate args, result free
             _dim_of(a, scope)

@@ -813,7 +813,7 @@ def _eval_call(node, env):
             out = np.where(cb, a, b)
         return np.asarray(out, dtype=np.float64)
 
-    if name in ('vec_avg', 'vec_sum', 'vec_max', 'vec_min'):
+    if name in ('vec_avg', 'vec_mean', 'vec_sum', 'vec_max', 'vec_min', 'vec_std'):
         _arity(name, ev, 1)
         v = ev[0]
         if not isinstance(v, VectorVal):
@@ -830,9 +830,27 @@ def _eval_call(node, env):
         if name == 'vec_min':
             s = np.where(valid, stack, np.inf).min(0)
             return np.where(any_valid, s, np.nan)
+        if name == 'vec_std':
+            cnt = valid.sum(0)
+            mu = np.where(valid, stack, 0.0).sum(0) / np.maximum(cnt, 1)
+            var = np.where(valid, (stack - mu) ** 2, 0.0).sum(0) / np.maximum(cnt - 1, 1)
+            return np.where(cnt >= 2, np.sqrt(np.maximum(var, 0.0)), np.nan)
         cnt = valid.sum(0)
         s = np.where(valid, stack, 0.0).sum(0)
         return np.where(cnt > 0, s / np.maximum(cnt, 1), np.nan)
+
+    if name == 'vec_choose':
+        # vec_choose(vector_field, index): pick one element of the 3D tensor
+        # (Brain idiom for strikes/tenors/quarters). Index is a literal.
+        _arity(name, ev, 2)
+        v = ev[0]
+        if not isinstance(v, VectorVal):
+            raise WQError(f"Incompatible unit for input of '{name}', expected Unit[Vector]")
+        k = ev[1]
+        if isinstance(k, np.ndarray):
+            raise WQError(f"Incompatible unit for input of '{name}', expected scalar index")
+        k = int(k) % len(v.parts)
+        return np.asarray(v.parts[k], dtype=np.float64)
 
     if name in ('vector_neut', 'group_vector_neut'):
         # Sec 2.5: project alpha orthogonal to a risk-factor vector, per day

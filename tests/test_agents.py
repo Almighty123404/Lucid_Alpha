@@ -43,3 +43,25 @@ def test_alignment_scores_hypothesis_coverage():
     assert s == 1.0
     assert alignment_score("unrelated story about nothing", ["rank(returns)"]) == 0.0
     assert alignment_score("anything", ["foo(bar)"]) is None
+
+def test_vec_ops_and_codebook_dims():
+    from fastexpr import Env, eval_node, parse
+    from data_gen import generate
+    panel = generate(seed=11, n_stocks=30, start="2020-01-01", end="2020-03-31")
+    env = Env(panel)
+    for e in ["vec_mean(analyst_eps_estimates)", "vec_std(analyst_eps_estimates)",
+              "vec_choose(option_implied_vol_surface, 2)", "vec_sum(segment_revenue)",
+              "rank(free_cash_flow / assets)", "ts_mean(est_eps, 20)",
+              "-rank(short_interest)", "group_neutralize(rank(eps), market)"]:
+        assert dimension_check(e) == [], e
+        out = eval_node(parse(e), env)
+        assert out.shape == (panel.fields["returns"].shape[0], 30), e
+    assert dimension_check("vec_std(returns)") != []
+    assert dimension_check("vec_choose(returns, 1)") != []
+
+
+def test_family_longest_match_no_collision():
+    from calibration import family_of_expression
+    assert family_of_expression("rank(capex / assets)") == "fundamental"
+    assert family_of_expression("rank(opt_open_interest)") == "derivatives"
+    assert family_of_expression("vec_mean(analyst_eps_estimates)") == "fundamental"

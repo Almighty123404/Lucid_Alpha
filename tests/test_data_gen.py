@@ -98,3 +98,25 @@ def test_rr21_tail_correlations_spike(med_panel):
         return float(np.nanmean(c[iu]))
     am = np.abs(mkt)
     assert meancorr(r[am >= np.nanquantile(am, 0.95)]) > meancorr(r)
+
+def test_codebook_extension_present(med_panel):
+    want = ["vwap", "shares_out", "adv60", "gross_profit", "net_income", "eps",
+            "equity", "working_capital", "free_cash_flow", "est_eps", "snt_news",
+            "iv_10", "hv_20", "put_call_ratio", "short_interest", "borrow_fee",
+            "insider_buying"]
+    for f in want:
+        assert f in med_panel.fields, f
+    for v in ["analyst_eps_estimates", "option_implied_vol_surface",
+              "segment_revenue", "price_volume_intraday"]:
+        assert v in med_panel.vector_fields, v
+        assert len(med_panel.vector_fields[v]) >= 3
+    assert "market" in med_panel.groups
+
+
+def test_codebook_identities(med_panel):
+    import numpy as np
+    f = med_panel.fields
+    m = np.isfinite(f["equity"]) & np.isfinite(f["assets"]) & np.isfinite(f["liabilities"])
+    assert bool((((f["equity"] - (f["assets"] - f["liabilities"]))[m]) == 0).all())
+    m2 = np.isfinite(f["free_cash_flow"]) & np.isfinite(f["operating_cash_flow"]) & np.isfinite(f["capex"])
+    assert bool((((f["free_cash_flow"] - (f["operating_cash_flow"] - f["capex"]))[m2]) == 0).all())

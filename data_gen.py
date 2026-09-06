@@ -435,6 +435,59 @@ def generate(seed=7, n_stocks=1000, start='2020-01-01', end='2022-12-31'):
                 r[dday, j] = -0.5
                 if dday + 1 < T:
                     r[dday + 1:, j] = 0.0
+    # Codebook extension (Brain reference mapping): every new field below is
+    # either (a) an accounting identity over already-PIT-served parents, so it
+    # inherits knowledge timing for free, or (b) a documented synthetic proxy
+    # with fresh trailing draws (appended AFTER all existing draws, so no
+    # upstream RNG stream shifts). NaN propagates from PIT parents naturally.
+    _fin = np.isfinite(close)
+    vwap = np.where(_fin, (high + low + close) / 3.0, np.nan)
+    shares_out_f = np.where(_fin, shares_out[None, :], np.nan)
+    adv60 = _roll_mean(dollar_vol, 60)
+    _gm = rng.uniform(0.25, 0.6, N)[None, :]
+    cogs = sales * (1.0 - _gm)
+    gross_profit = sales - cogs
+    operating_income = ebitda * 0.85
+    net_income = ebitda * 0.6
+    eps = net_income / np.maximum(shares_out[None, :], 1e-12)
+    tax_expense = ebitda * 0.15
+    liabilities = debt + liabilities_curr
+    equity = assets - liabilities
+    cash_and_equiv = assets_curr * 0.3
+    retained_earnings = equity * 0.4
+    goodwill = assets * 0.1
+    working_capital = assets_curr - liabilities_curr
+    operating_cash_flow = ebitda * 0.9
+    capex = sales * 0.05
+    free_cash_flow = operating_cash_flow - capex
+    dividends_paid = np.maximum(net_income, 0.0) * 0.3
+    # Analyst overlays are synthetic consensus proxies (APPROX, daily noise —
+    # not revision-logged like fundamentals; flagged in staleness register).
+    est_eps = eps * 4.0 * (1.0 + rng.normal(0.0, 0.03, (T, N)))
+    est_revenue = sales * 4.0 * (1.0 + rng.normal(0.0, 0.03, (T, N)))
+    est_eps_std = np.abs(est_eps) * 0.15
+    recommendation = np.clip(3.0 + rng.normal(0.0, 0.8, (T, N)), 1.0, 5.0)
+    eps_surprise = rng.normal(0.0, 0.05, (T, N))
+    # Sentiment matrix legs share the calibrated news coverage mask.
+    snt_news = np.where(sent_cov, np.clip(sent_z * 0.3 + rng.normal(0.0, 0.2, (T, N)), -1.0, 1.0), np.nan)
+    snt_social = np.where(sent_cov, np.clip(sent_z * 0.2 + rng.normal(0.0, 0.3, (T, N)), -1.0, 1.0), np.nan)
+    news_volume = np.where(sent_cov, np.maximum(np.round(np.where(np.isfinite(buzz), buzz, 0.0) * 2.0), 0.0), np.nan)
+    # Options summary legs from the tenor-graded IV fields (same masks).
+    iv_10 = np.where(iv_cov_10, (call_10 + put_10) / 2.0, np.nan)
+    iv_30 = np.where(iv_cov_60, (call_60 + put_60) / 2.0, np.nan)
+    hv_20 = rv20 * np.sqrt(252.0) * 100.0
+    # put_call_ratio is a liquidity-demand proxy (APPROX): no option-volume
+    # model exists, so skew + noise stands in. Documented, not structural.
+    put_call_ratio = 0.7 + 2.0 * np.clip(skew0[None, :], -0.1, 0.2) + rng.normal(0.0, 0.1, (T, N))
+    opt_open_interest = (liq_rank[None, :] * 1e6) * (1.0 + rng.normal(0.0, 0.2, (T, N)))
+    # Short/insider overlays: persistent short fraction + sparse insider prints.
+    _short_frac = np.clip(np.abs(rng.normal(0.02, 0.02, N))[None, :] + rng.normal(0.0, 0.002, (T, N)), 0.0, 0.2)
+    short_interest = np.where(_fin, shares_out[None, :] * _short_frac, np.nan)
+    days_to_cover = np.where(_fin, (short_interest * close) / np.maximum(adv20, 1e-12), np.nan)
+    borrow_fee = np.clip(0.0025 + _short_frac * 0.5 + rng.normal(0.0, 0.002, (T, N)), 0.0025, None)
+    _ins = rng.random((T, N)) < 0.02
+    insider_buying = np.where(_ins & _fin, np.abs(rng.normal(0.0, 1.0, (T, N))) * size[None, :] * 1e-4, 0.0)
+    insider_selling = np.where(_ins & _fin, -np.abs(rng.normal(0.0, 1.0, (T, N))) * size[None, :] * 1e-4, 0.0)
     fields = {
         'close': close,
         'open': open_,
@@ -455,9 +508,60 @@ def generate(seed=7, n_stocks=1000, start='2020-01-01', end='2022-12-31'):
         'implied_volatility_put_10': put_10,
         'implied_volatility_put_60': put_60,
         'buzz': buzz,
+        'vwap': vwap,
+        'shares_out': shares_out_f,
+        'adv60': adv60,
+        'cogs': cogs,
+        'gross_profit': gross_profit,
+        'operating_income': operating_income,
+        'net_income': net_income,
+        'eps': eps,
+        'tax_expense': tax_expense,
+        'liabilities': liabilities,
+        'equity': equity,
+        'cash_and_equiv': cash_and_equiv,
+        'retained_earnings': retained_earnings,
+        'goodwill': goodwill,
+        'working_capital': working_capital,
+        'operating_cash_flow': operating_cash_flow,
+        'capex': capex,
+        'free_cash_flow': free_cash_flow,
+        'dividends_paid': dividends_paid,
+        'est_eps': est_eps,
+        'est_revenue': est_revenue,
+        'est_eps_std': est_eps_std,
+        'recommendation': recommendation,
+        'eps_surprise': eps_surprise,
+        'snt_news': snt_news,
+        'snt_social': snt_social,
+        'news_volume': news_volume,
+        'iv_10': iv_10,
+        'iv_30': iv_30,
+        'hv_20': hv_20,
+        'put_call_ratio': put_call_ratio,
+        'opt_open_interest': opt_open_interest,
+        'short_interest': short_interest,
+        'days_to_cover': days_to_cover,
+        'borrow_fee': borrow_fee,
+        'insider_buying': insider_buying,
+        'insider_selling': insider_selling,
     }
-    vector_fields = {'nws12_afterhsz_01l': vec_parts}
-    groups = {'sector': sector, 'industry': industry}
+    # Vector (3D tensor) codebook: parts lists match the existing VectorVal
+    # convention (one matrix per element). Estimates across forward quarters,
+    # IV surface across moneyness, revenue by segment, intraday buckets.
+    _est_q = [est_eps * (1.0 + (q + 1) * 0.02 + rng.normal(0.0, 0.02, (T, N))) for q in range(4)]
+    _skew_mid = np.where(np.isfinite(call_60) & np.isfinite(put_60), (call_60 + put_60) / 2.0, np.nan)
+    _surf = [put_60 * 1.15, put_60 * 1.05, _skew_mid, call_60 * 1.05, call_60 * 1.15]
+    _seg_w = rng.dirichlet([1.0, 1.0, 1.0, 1.0], N).T  # (4, N) static shares
+    _seg_rev = [sales * _seg_w[q][None, :] for q in range(4)]
+    _intra = [volume / 6.0 * (1.0 + rng.normal(0.0, 0.1, (T, N))) for _ in range(6)]
+    vector_fields = {'nws12_afterhsz_01l': vec_parts,
+                     'analyst_eps_estimates': _est_q,
+                     'option_implied_vol_surface': _surf,
+                     'segment_revenue': _seg_rev,
+                     'price_volume_intraday': _intra}
+    groups = {'sector': sector, 'industry': industry,
+              'market': np.zeros(N, dtype=int)}
     n_sub = max(1, int(N * 0.5))
     subuniverse = liq_rank >= np.sort(liq_rank)[-n_sub]
     panel = Panel(dates=dates, fields=fields, vector_fields=vector_fields,
@@ -493,7 +597,17 @@ def validate_panel(panel):
     req = {'close', 'open', 'high', 'low', 'volume', 'returns', 'adv20', 'cap',
            'ebitda', 'sales', 'debt', 'assets',
            'implied_volatility_call_10', 'implied_volatility_call_60',
-           'implied_volatility_put_10', 'implied_volatility_put_60', 'buzz'}
+           'implied_volatility_put_10', 'implied_volatility_put_60', 'buzz',
+           'vwap', 'shares_out', 'adv60',
+           'cogs', 'gross_profit', 'operating_income', 'net_income', 'eps',
+           'tax_expense', 'liabilities', 'equity', 'cash_and_equiv',
+           'retained_earnings', 'goodwill', 'working_capital',
+           'operating_cash_flow', 'capex', 'free_cash_flow', 'dividends_paid',
+           'est_eps', 'est_revenue', 'est_eps_std', 'recommendation',
+           'eps_surprise', 'snt_news', 'snt_social', 'news_volume',
+           'iv_10', 'iv_30', 'hv_20', 'put_call_ratio', 'opt_open_interest',
+           'short_interest', 'days_to_cover', 'borrow_fee', 'insider_buying',
+           'insider_selling'}
     missing = req - set(panel.fields)
     if missing:
         raise ValueError(f"panel missing fields: {sorted(missing)}")
