@@ -152,6 +152,7 @@ def generate_real_panel(seed=7, n_stocks=200, start="2020-01-01", end="2022-12-3
 
     sector = rng.integers(0, 10, N)
     industry = sector * 3 + rng.integers(0, 3, N)
+    subindustry = industry * 2 + (np.arange(N) % 2)  # deterministic: no RNG (see data_gen note)
 
     liq = np.nanmean(dollar_vol, axis=0)
     liq_rank = _rank1d(np.where(np.isfinite(liq), liq, 0.0))
@@ -162,6 +163,14 @@ def generate_real_panel(seed=7, n_stocks=200, start="2020-01-01", end="2022-12-3
     med_rv = np.nanmedian(rv20, axis=0)
     rv20 = np.where(np.isfinite(rv20), rv20, med_rv)
     iv_base = rv20 * np.sqrt(252.0) * 100.0 * (1.05 + rng.normal(0.0, 0.08, (T, N))) + 8.0
+    # C6 SSVI mirror (see data_gen): arbitrage-free slices, not ad-hoc
+    # multiples. Asymmetry (documented): no regime mult here — realized real
+    # vols already embed crises (crisis=zeros); data_gen scales its synthetic
+    # anchor instead. Masks/noise structure identical; asserts run every build.
+    # Surface computed below once skew0 exists (side-effect-free import only).
+    from iv_surface import (generate_iv_surface as _geniv,
+                            assert_no_calendar_arb as _calarb,
+                            assert_coverage_nesting as _nest)
     iv_cov = rng.random((T, N)) < p_iv
     iv_black = _blackout_masks(rng, T, 1, 0.008, 0.1, 5)
     iv_cov &= ~iv_black[:, None]
@@ -174,46 +183,78 @@ def generate_real_panel(seed=7, n_stocks=200, start="2020-01-01", end="2022-12-3
         return np.where(hit, rng.uniform(0.02, 0.1, (T, N)), 1.0)
 
     skew0 = rng.normal(0.03, 0.05, N)
-    call_10 = iv_base * _tiny_scale(iv_cov_10) * (1.0 + rng.normal(0.0, 0.03, (T, N)))
-    call_60 = iv_base * _tiny_scale(iv_cov_60) * (1.0 + rng.normal(0.0, 0.05, (T, N)))
-    put_10 = iv_base * (1.0 + skew0[None, :]) * _tiny_scale(iv_cov_10) * (1.0 + rng.normal(0.0, 0.03, (T, N)))
-    put_60 = iv_base * (1.0 + skew0[None, :]) * _tiny_scale(iv_cov_60) * (1.0 + rng.normal(0.0, 0.05, (T, N)))
+    _surf, _thetas = _geniv(iv_base, liq_rank, skew0, np.zeros(T))
+    _calarb(_thetas)
+    # Sticky-ratio puts mirror data_gen: static per-name wing markup from the
+    # surface at mean theta (put/call persistence, not level-chasing).
+    from iv_surface import term_mult as _tm, ssvi_total_var as _ssviw, ssvi_params as _ssvip
+    _rho_s, _eta_s = _ssvip(liq_rank, skew0, np.zeros(N))
+    _thm = 0.25 ** 2  # reference-vol evaluation mirrors data_gen (static ranks)
+    _s, _sk = {}, {10.0: -0.15, 60.0: -0.25, 720.0: -0.35}
+    for _Td, _Ty in ((10.0, 10.0 / 365.0), (60.0, 60.0 / 365.0), (720.0, 720.0 / 365.0)):
+        _th = np.maximum(_thm * _tm(float(_Td)) ** 2, 1e-8)
+        _wW = _ssviw(_sk[float(_Td)], _th, _rho_s, _eta_s)
+        _wA = _ssviw(0.0, _th, _rho_s, _eta_s)
+        _s[float(_Td)] = np.sqrt(_wW / np.maximum(_wA, 1e-12)) - 1.0
+    call_10 = _surf[10.0][:, :, 2] * _tiny_scale(iv_cov_10) * (1.0 + rng.normal(0.0, 0.03, (T, N)))
+    call_60 = _surf[60.0][:, :, 2] * _tiny_scale(iv_cov_60) * (1.0 + rng.normal(0.0, 0.05, (T, N)))
+    put_10 = _surf[10.0][:, :, 2] * (1.0 + _s[10.0])[None, :] * _tiny_scale(iv_cov_10) * (1.0 + rng.normal(0.0, 0.03, (T, N)))
+    put_60 = _surf[60.0][:, :, 2] * (1.0 + _s[60.0])[None, :] * _tiny_scale(iv_cov_60) * (1.0 + rng.normal(0.0, 0.05, (T, N)))
     call_10 = np.where(iv_cov_10, call_10, np.nan)
     call_60 = np.where(iv_cov_60, call_60, np.nan)
     put_10 = np.where(iv_cov_10, put_10, np.nan)
     put_60 = np.where(iv_cov_60, put_60, np.nan)
+    # 720d tenor mirrors data_gen (SSVI ATM slice, term premium via term_mult).
+    long_keep = 0.15 + 0.45 * liq_rank[None, :]
+    iv_cov_720 = iv_cov_60 & (rng.random((T, N)) < long_keep)
+    call_720 = np.where(iv_cov_720, _surf[720.0][:, :, 2] * (1.0 + rng.normal(0.0, 0.02, (T, N))), np.nan)
+    put_720 = np.where(iv_cov_720, _surf[720.0][:, :, 2] * (1.0 + _s[720.0])[None, :] * (1.0 + rng.normal(0.0, 0.02, (T, N))), np.nan)
+    _nest(iv_cov_60, iv_cov_10, iv_cov_720)
 
     margin = rng.beta(3.0, 12.0, N) * 0.35
     lev = np.clip(rng.normal(0.35, 0.15, N), 0.02, 0.9)
     nq = int(np.ceil(T / 63))
-    sales_q = (liq * 0.8 / np.nanmedian(liq) * 1e9)[None, :] if np.nanmedian(liq) > 0 else rng.uniform(1e8, 1e9, (1, N))
-    if sales_q.shape[1] != N:
-        sales_q = np.broadcast_to(sales_q, (1, N))
-    sales_q = np.repeat(sales_q, nq, axis=0) * np.exp(rng.normal(0.0, 0.06, (nq, N)))
-    margin_q = np.clip(margin[None, :] + rng.normal(0.0, 0.008, (nq, N)), 0.01, 0.45)
-    turnover_a = rng.uniform(0.4, 1.8, N)
-    assets_q = sales_q / turnover_a[None, :]
-    debt_q = assets_q * lev[None, :]
-    curr_a = rng.uniform(0.25, 0.5, N)
+    # Parent unification mirror (see data_gen): generator runs FIRST, margin_q
+    # from its E states; the beta-jitter draw is removed (downstream shift ok).
+    from fundamentals import generate_fundamentals_q as _genfund, apply_equity_floor as _eqfloor
+    from fundamentals import FUND_DEFAULTS as _FUND_DEFAULTS
+    _size_proxy = np.nan_to_num(liq / np.nanmedian(liq) * 1e9, nan=1e8, posinf=1e9, neginf=1e8)
+    _size_proxy = np.maximum(_size_proxy, 1e7)
+    _rng_fund = np.random.default_rng([seed, 0xF17D])
+    _lev_clip = np.clip(lev, 0.03, 0.89)
+    _fparams = dict(_FUND_DEFAULTS,
+                    mu_e=np.clip(margin, 0.02, 0.40),
+                    mu_c=np.clip(margin - 0.035, -0.25, 0.40),
+                    mu_l=np.log(_lev_clip / (1.0 - _lev_clip)))
+    _fund = _genfund(_rng_fund, _size_proxy, nq, None, _fparams)
+    margin_q = (_fund["ebitda_q"] / np.maximum(_fund["sales_q"], 1e-12))
+    sales_q, assets_q, cfo_q = _fund["sales_q"], _fund["assets_q"], _fund["cfo_q"]
+    # WC positivity mirrors data_gen (corr-leg review #40).
     liab_c = rng.uniform(0.08, 0.3, N)
+    curr_a = liab_c + rng.uniform(0.05, 0.30, N)
+    debt_q, _, _distress_q = _eqfloor(assets_q, assets_q * _fund["lev_q"], assets_q * liab_c[None, :])
 
     # Phase 4 PIT (mirrors data_gen): overlays are synthetic, so they get the
-    # same knowledge-bounded serving (20-45d lag + 2% restatements) rather
-    # than zero-lag forward-fill. ebitda uses PIT margin for consistency.
-    from pit import build_revision_log as _brl, pit_asof_multi as _am, validate_pit as _vpit
+    # same knowledge-bounded serving (v2: size-graded lags, two-stage
+    # restatements) rather than zero-lag forward-fill.
+    from pit import build_revision_log_v2 as _brl, pit_asof_multi as _am, validate_pit as _vpit
     _pe = np.array([dates[min((q + 1) * 63 - 1, T - 1)] for q in range(nq)])
-    _pit4 = _am({"sales": _brl(_pe, sales_q, "sales", rng),
-                 "margin": _brl(_pe, margin_q, "margin", rng),
-                 "assets": _brl(_pe, assets_q, "assets", rng),
-                 "debt": _brl(_pe, debt_q, "debt", rng)}, dates)
+    _is_q4 = np.array([(q % 4 == 3) for q in range(nq)])
+    _pit4 = _am({"sales": _brl(_pe, sales_q, "sales", rng, liq_rank=liq_rank, is_q4=_is_q4),
+                 "margin": _brl(_pe, margin_q, "margin", rng, liq_rank=liq_rank, is_q4=_is_q4),
+                 "assets": _brl(_pe, assets_q, "assets", rng, liq_rank=liq_rank, is_q4=_is_q4),
+                 "debt": _brl(_pe, debt_q, "debt", rng, liq_rank=liq_rank, is_q4=_is_q4, distress=_distress_q),
+                 "cashflow_op": _brl(_pe, cfo_q, "cashflow_op", rng, liq_rank=liq_rank, is_q4=_is_q4, distress=_distress_q)}, dates)
     sales, _skn = _pit4["sales"]
     _marg_pit, _mkn = _pit4["margin"]
     assets, _akn = _pit4["assets"]
     debt, _dkn = _pit4["debt"]
+    cashflow_op, _ckn = _pit4["cashflow_op"]
     _vpit(sales, _skn, dates)
     _vpit(_marg_pit, _mkn, dates)
     _vpit(assets, _akn, dates)
     _vpit(debt, _dkn, dates)
+    _vpit(cashflow_op, _ckn, dates)
     ebitda = sales * _marg_pit
     assets_curr = assets * curr_a[None, :]
     liabilities_curr = assets * liab_c[None, :]
@@ -236,6 +277,19 @@ def generate_real_panel(seed=7, n_stocks=200, start="2020-01-01", end="2022-12-3
     sent_obs = np.where(sent_cov, sent_z * 0.9 + rng.normal(0.0, 0.5, (T, N)) + jumps, np.nan)
     vec_parts = [np.where(sent_cov, sent_obs + rng.normal(0.0, 0.35, (T, N)), np.nan) for _ in range(3)]
     buzz = np.where(sent_cov, 1.5 + np.abs(sent_z) * 1.5 + rng.normal(0.0, 0.7, (T, N)), np.nan)
+    # Second sentiment process mirrors data_gen (independent AR(1), own mask).
+    _phi2, _s2 = 0.90, rng.normal(0.0, 1.0, N)
+    _lat2 = np.zeros((T, N))
+    _is2 = np.sqrt(1 - _phi2 * _phi2)
+    for _t in range(T):
+        _s2 = _phi2 * _s2 + _is2 * rng.normal(0.0, 1.0, N)
+        _lat2[_t] = _s2
+    _sent2_z = np.nan_to_num(_cs_z(_lat2), nan=0.0)
+    _p2 = 0.015 + 0.08 * liq_rank[None, :] ** 2
+    _blk2 = _blackout_masks(rng, T, 1, 0.02, 0.01, 12)
+    _cov2 = (rng.random((T, N)) < _p2) & (~_blk2[:, None] | (rng.random((T, N)) < 0.01))
+    _obs2 = np.where(_cov2, _sent2_z * 0.9 + rng.normal(0.0, 0.5, (T, N)), np.nan)
+    scl12_parts = [np.where(_cov2, _obs2 + rng.normal(0.0, 0.35, (T, N)), np.nan) for _ in range(3)]
 
     # Codebook extension mirrors data_gen (same documented proxies; overlays
     # stay synthetic APPROX). Real panel specifics: shares_out is constant
@@ -248,20 +302,29 @@ def generate_real_panel(seed=7, n_stocks=200, start="2020-01-01", end="2022-12-3
     _gm = rng.uniform(0.25, 0.6, N)[None, :]
     cogs = sales * (1.0 - _gm)
     gross_profit = sales - cogs
-    operating_income = ebitda * 0.85
-    net_income = ebitda * 0.6
+    operating_income = ebitda - 0.15 * ebitda
+    _interest = debt * (0.04 / 252.0)
+    _ebt = ebitda - 0.15 * ebitda - _interest
+    tax_expense = 0.21 * np.maximum(_ebt, 0.0)
+    net_income = _ebt - tax_expense
     eps = net_income / 1e8
-    tax_expense = ebitda * 0.15
+    liabilities = debt + liabilities_curr
+    # C2/C3 daily mirror of data_gen: exact identity, rescale debt on breach.
+    _eq_pre = assets - liabilities
+    _bad = _eq_pre < 0.05 * assets
+    debt = np.where(_bad, assets * 0.95 - liabilities_curr, debt)
     liabilities = debt + liabilities_curr
     equity = assets - liabilities
     cash_and_equiv = assets_curr * 0.3
     retained_earnings = equity * 0.4
     goodwill = assets * 0.1
     working_capital = assets_curr - liabilities_curr
-    operating_cash_flow = ebitda * 0.9
+    # C5 single cash-flow truth (mirrors data_gen): PIT-served cashflow_op.
+    operating_cash_flow = cashflow_op
     capex = sales * 0.05
     free_cash_flow = operating_cash_flow - capex
     dividends_paid = np.maximum(net_income, 0.0) * 0.3
+    return_assets = net_income / np.maximum(assets, 1e-12)  # G1 mirror
     est_eps = eps * 4.0 * (1.0 + rng.normal(0.0, 0.03, (T, N)))
     est_revenue = sales * 4.0 * (1.0 + rng.normal(0.0, 0.03, (T, N)))
     est_eps_std = np.abs(est_eps) * 0.15
@@ -293,9 +356,12 @@ def generate_real_panel(seed=7, n_stocks=200, start="2020-01-01", end="2022-12-3
         "close": close, "open": open_, "high": high, "low": low,
         "volume": volume, "returns": returns, "adv20": adv20, "cap": cap,
         "ebitda": ebitda, "sales": sales, "debt": debt, "assets": assets,
+        "cashflow_op": cashflow_op,
         "liabilities_curr": liabilities_curr, "assets_curr": assets_curr,
         "implied_volatility_call_10": call_10, "implied_volatility_call_60": call_60,
         "implied_volatility_put_10": put_10, "implied_volatility_put_60": put_60,
+        "implied_volatility_call_720": call_720,
+        "implied_volatility_put_720": put_720,
         "buzz": buzz,
         "vwap": vwap, "shares_out": shares_out, "adv60": adv60,
         "cogs": cogs, "gross_profit": gross_profit, "operating_income": operating_income,
@@ -304,6 +370,7 @@ def generate_real_panel(seed=7, n_stocks=200, start="2020-01-01", end="2022-12-3
         "retained_earnings": retained_earnings, "goodwill": goodwill,
         "working_capital": working_capital, "operating_cash_flow": operating_cash_flow,
         "capex": capex, "free_cash_flow": free_cash_flow, "dividends_paid": dividends_paid,
+        "return_assets": return_assets,
         "est_eps": est_eps, "est_revenue": est_revenue, "est_eps_std": est_eps_std,
         "recommendation": recommendation, "eps_surprise": eps_surprise,
         "snt_news": snt_news, "snt_social": snt_social, "news_volume": news_volume,
@@ -311,13 +378,19 @@ def generate_real_panel(seed=7, n_stocks=200, start="2020-01-01", end="2022-12-3
         "opt_open_interest": opt_open_interest, "short_interest": short_interest,
         "days_to_cover": days_to_cover, "borrow_fee": borrow_fee,
         "insider_buying": insider_buying, "insider_selling": insider_selling,
+        "revenue": sales, "op_income": operating_income, "ni": net_income,
+        "total_debt": debt, "ocf": operating_cash_flow, "fcf": free_cash_flow,
+        "pcr": put_call_ratio, "implied_volatility_10": iv_10,
+        "implied_volatility_30": iv_30, "historical_volatility_20": hv_20,
     }
     vector_fields = {"nws12_afterhsz_01l": vec_parts,
+                     "scl12_alltype_buzzvec": scl12_parts,
+                     "scl12_buzzvec": scl12_parts,  # alias, mirrors data_gen
                      "analyst_eps_estimates": _est_q,
                      "option_implied_vol_surface": _surf,
                      "segment_revenue": _seg_rev,
                      "price_volume_intraday": _intra}
-    groups = {"sector": sector, "industry": industry,
+    groups = {"sector": sector, "industry": industry, "subindustry": subindustry,
               "market": np.zeros(N, dtype=int)}
     n_sub = max(1, int(N * 0.5))
     subuniverse = liq_rank >= np.sort(liq_rank)[-n_sub]

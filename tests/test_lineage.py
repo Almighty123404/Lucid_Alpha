@@ -167,3 +167,19 @@ def test_promotion_expected_real_blocks_and_passes(panel, refs):
     el2, info2 = promotion_eligible(rep, reg, DSR_PROMOTE, "default", expect_real=harsh)
     assert el2 is False
     assert any("expected-real" in r for r in info2["reasons"])
+
+
+def test_turnover_slope_pooled_scope():
+    import calibration, os
+    s = calibration.turnover_slope(scope='submitted')
+    assert s is not None and s['n'] == 8  # tracked pairs only, RR-29 artifact fit
+    p = calibration.turnover_slope()  # default pooled
+    batch = os.path.exists(os.path.join('calibration', 'unsubmitted_sim_fce89a4b.jsonl'))
+    import glob as _g
+    any_batch = bool(_g.glob(os.path.join('calibration', 'unsubmitted_sim_*.jsonl')))
+    if any_batch:
+        assert p['n'] >= 40 and p['span'] >= 30.0
+        assert abs(p['slope']) < 0.2  # flat law: bias ~additive, no TO dependence
+    else:
+        assert p == s  # no batch file -> falls back to submitted
+

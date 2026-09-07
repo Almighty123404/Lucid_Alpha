@@ -122,18 +122,55 @@ def expected_real_metrics(sim_metrics, adjustment):
     return out
 
 
-def turnover_slope(pool=None, min_points=4, min_span=30.0):
+def load_unsubmitted_pairs():
+    """Pool-format turnover pairs from the gitignored unsubmitted batch.
+
+    Reads the latest calibration/unsubmitted_sim_*.jsonl (index-level sim
+    metrics + real TO, no expressions leave the file). Returns [] when no
+    batch file exists (callers fall back to submitted-only).
+    """
+    import glob as _glob
+    import json as _json
+    import os as _os
+    files = sorted(_glob.glob(os.path.join(CALIB_DIR, "unsubmitted_sim_*.jsonl")),
+                   key=_os.path.getmtime)
+    if not files:
+        return []
+    out = []
+    with open(files[-1]) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            r = _json.loads(line)
+            if (r.get("status") == "OK"
+                    and isinstance(r.get("sim_TO"), (int, float))
+                    and isinstance(r.get("real_TO"), (int, float))):
+                out.append({"predicted_metrics": {"turnover_pct": r["sim_TO"]},
+                            "real_metrics": {"turnover_pct": r["real_TO"]}})
+    return out
+
+
+def turnover_slope(pool=None, min_points=4, min_span=30.0, scope="pooled"):
     """Linear turnover-bias model: delta (= pred - real) ~= a*TO_sim + b.
 
     The additive correction is the wrong shape (miss grows with turnover:
     -0.3 at 60% vs -22.6 at 69%). Returns {"slope","intercept","n","span"}
     or None when fewer than min_points pairs or sim-TO span below min_span
     pp — one point doesn't make a slope. Closed-form OLS, no fitting library.
+
+    scope="submitted" uses the 9 tracked pairs only (legacy RR-29 fit:
+    slope +0.45 — an n=8 artifact). scope="pooled" (default) adds the
+    gitignored 40-pair unsubmitted batch: slope collapses to ~+0.10,
+    i.e. the bias is essentially additive (~-12pp) with no meaningful
+    turnover dependence. Falls back to submitted-only when no batch file.
     """
     import numpy as _np
     if pool is None:
         pool = [r for r in load_records()
                 if r.get("real_metrics") and r.get("predicted_metrics")]
+        if scope == "pooled":
+            pool = pool + load_unsubmitted_pairs()
     pts = [(r["predicted_metrics"]["turnover_pct"], r["real_metrics"]["turnover_pct"])
            for r in pool
            if isinstance(r["predicted_metrics"].get("turnover_pct"), (int, float))
@@ -155,12 +192,13 @@ _FAMILY_TOKENS = {
                     "cogs", "gross_profit", "income", "eps", "equity",
                     "cash", "retained", "goodwill", "working_capital",
                     "capex", "dividends", "tax", "revenue", "fcf",
-                    "ocf", "analyst", "recommendation", "surprise", "segment"),
+                    "ocf", "analyst", "recommendation", "surprise", "segment",
+                    "ni", "total_debt"),
     "microstructure": ("returns", "close", "open", "high", "low", "volume", "adv20", "cap",
                        "vwap", "shares_out", "short_interest", "days_to_cover",
                        "borrow_fee", "insider", "intraday"),
-    "derivatives": ("implied_volatility", "iv_", "hv_", "put_call", "opt_open",
-                    "skew", "option"),
+    "derivatives": ("implied_volatility", "iv_", "hv_", "historical", "put_call", "pcr",
+                    "opt_open", "skew", "option"),
 }
 
 

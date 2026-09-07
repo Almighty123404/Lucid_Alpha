@@ -69,3 +69,36 @@ def test_multi_matches_single():
     assert (np.nan_to_num(out["assets"][0]) == np.nan_to_num(v2)).all()
     validate_pit(out["sales"][0], out["sales"][1], DAYS)
     validate_pit(out["assets"][0], out["assets"][1], DAYS)
+
+
+def test_revision_log_v2_gradients_and_bounds():
+    from pit import build_revision_log_v2
+    r = __import__('numpy').random.default_rng(3)
+    N, Q = 60, 8
+    pe = __import__('numpy').array(['2020-01-01','2020-04-01','2020-07-01','2020-10-01','2021-01-01','2021-04-01','2021-07-01','2021-10-01'], dtype='datetime64[D]')
+    vq = __import__('numpy').full((Q, N), 100.0)
+    liq = (__import__('numpy').arange(N) % 10) / 9.0
+    rows = build_revision_log_v2(pe, vq, 'sales', r, liq_rank=liq)
+    lag = {(x['sid'], x['period_end']): (__import__('numpy').datetime64(x['knowledge_ts']) - __import__('numpy').datetime64(x['period_end'])).astype(int) for x in rows if x['rev_seq'] == 1}
+    import numpy as _np
+    top = _np.mean([v for (s, _), v in lag.items() if liq[s] > 0.8])
+    bot = _np.mean([v for (s, _), v in lag.items() if liq[s] < 0.2])
+    assert top < bot - 3.0, (top, bot)
+    cells = {(x['sid'], x['period_end']) for x in rows}
+    r2 = [x for x in rows if x['rev_seq'] == 2]
+    rate = len({(x['sid'], x['period_end']) for x in r2}) / len(cells)
+    assert 0.01 <= rate <= 0.03, rate
+    for x in r2:
+        d = (np.datetime64(x['knowledge_ts']) - np.datetime64(x['period_end'])).astype(int)
+        assert d <= 45 + 10 + 120, d
+
+
+def test_revision_log_v2_backcompat_uniform():
+    from pit import build_revision_log_v2
+    import numpy as _np
+    r = _np.random.default_rng(5)
+    pe = _np.array(['2020-01-01','2020-04-01'], dtype='datetime64[D]')
+    rows = build_revision_log_v2(pe, _np.full((2, 20), 50.0), 'x', r, size_graded_lag=False, q4_bump=False)
+    lags = [(np.datetime64(x['knowledge_ts']) - np.datetime64(x['period_end'])).astype(int) for x in rows if x['rev_seq'] == 1]
+    assert min(lags) >= 20 and max(lags) <= 45
+

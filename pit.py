@@ -192,6 +192,66 @@ def _assemble(got, decisions, T, N):
     return vals, kn
 
 
+def build_revision_log_v2(period_ends, values_q, field, rng, liq_rank=None,
+                          distress=None, is_q4=None,
+                          lag_lo=20, lag_hi=45, restate_p=0.02, restate_lambda=0.4,
+                          rev_sigma=0.02, distress_sigma=0.05,
+                          size_graded_lag=True, q4_bump=True):
+    """Revision log v2 (Agent-2 blueprint §4): size-graded lags, two-stage
+    restatements, distress-scaled revision vol, Q4 audit effect.
+
+    Same row schema as build_revision_log (drop-in for pit_asof_multi +
+    validate_pit). Differences:
+      lag: 20 + Binomial(25, 0.5 - 0.25*liq_rank) (liquid names report
+        faster); uniform U[lag_lo, lag_hi] when liq_rank is None or
+        size_graded_lag=False (== v1 means, back-compat).
+      restatements: Bernoulli(restate_p), then count 1 + Poisson(lambda)
+        capped at 3 extras (double-restaters exist at ~0.3%).
+      revision value: N(0, rev_sigma), distress_sigma where distress==1,
+        mean-shifted -1% in distress (negative-skewed revisions).
+      Q4: +10d lag, restate_p x 1.5 (audit effect) where is_q4 is True;
+        disabled when q4_bump=False.
+    Falsifiers: E[lag|top-liq] < E[lag|bottom-liq] by >=3d; restated-cell
+    rate in [1%, 3%]; no knowledge2 - knowledge > 120d.
+    """
+    Q, N = values_q.shape
+    if liq_rank is None:
+        liq_rank = np.full(N, 0.5)
+    liq_rank = np.asarray(liq_rank, dtype=float)
+    rows = []
+    for q in range(Q):
+        pe = np.datetime64(period_ends[q])
+        q4 = bool(is_q4[q]) if is_q4 is not None else False
+        for j in range(N):
+            v = float(values_q[q, j])
+            if v != v:
+                continue
+            if size_graded_lag:
+                p_size = 0.5 - 0.25 * liq_rank[j]
+                lag = 20 + int(rng.binomial(25, p_size))
+            else:
+                lag = int(rng.integers(lag_lo, lag_hi + 1))
+            if q4 and q4_bump:
+                lag += 10
+            kts = pe + np.timedelta64(lag, 'D')
+            rows.append({"sid": int(j), "field": field,
+                         "period_end": str(pe), "knowledge_ts": str(kts),
+                         "value": v, "rev_seq": 1})
+            pr = restate_p * (1.5 if (q4 and q4_bump) else 1.0)
+            if rng.random() < pr:
+                n_extra = min(1 + int(rng.poisson(restate_lambda)), 3)
+                for _ in range(n_extra):
+                    k2 = kts + np.timedelta64(min(int(30 + rng.exponential(25)), 120), 'D')
+                    sig = distress_sigma if (distress is not None and distress[q, j]) else rev_sigma
+                    shift = -0.01 if (distress is not None and distress[q, j]) else 0.0
+                    rows.append({"sid": int(j), "field": field,
+                                 "period_end": str(pe), "knowledge_ts": str(k2),
+                                 "value": v * float(1.0 + shift + rng.normal(0.0, sig)),
+                                 "rev_seq": 2})
+                    kts = k2
+    return rows
+
+
 def validate_pit(values, knowledge, decisions):
     """Assert the leakage invariant on a served panel.
 

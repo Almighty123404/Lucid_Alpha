@@ -65,3 +65,22 @@ def test_family_longest_match_no_collision():
     assert family_of_expression("rank(capex / assets)") == "fundamental"
     assert family_of_expression("rank(opt_open_interest)") == "derivatives"
     assert family_of_expression("vec_mean(analyst_eps_estimates)") == "fundamental"
+
+def test_alias_and_subindustry_support():
+    from fastexpr import Env, eval_node, parse
+    from data_gen import generate
+    from calibration import family_of_expression
+    panel = generate(seed=11, n_stocks=30, start="2020-01-01", end="2020-03-31")
+    env = Env(panel)
+    for e in ["rank(revenue / assets)", "rank(ni / sales)", "rank(total_debt / assets)",
+              "ts_mean(ocf, 20)", "rank(fcf)", "ts_mean(pcr, 20)",
+              "ts_mean(implied_volatility_10, 20)", "ts_mean(historical_volatility_20, 20)",
+              "group_rank(rank(returns), subindustry)",
+              "group_neutralize(rank(returns), subindustry)"]:
+        assert dimension_check(e) == [], e
+        out = eval_node(parse(e), env)
+        assert out.shape == (panel.fields["returns"].shape[0], 30), e
+    assert family_of_expression("rank(total_debt / assets)") == "fundamental"
+    assert family_of_expression("rank(ni)") == "fundamental"
+    assert family_of_expression("ts_mean(pcr, 20)") == "derivatives"
+    assert family_of_expression("vec_mean(analyst_eps_estimates)") == "fundamental"

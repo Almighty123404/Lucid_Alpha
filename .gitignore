@@ -14,3 +14,5 @@ reports/trials.jsonl
 reports/gp_campaign.json
 context.json
 calibration/private_records.jsonl
+calibration/unsubmitted_records.jsonl
+calibration/unsubmitted_sim_*.jsonl

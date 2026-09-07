@@ -159,8 +159,117 @@ def main():
         "Leverage magnitude + turnover floor (sign closed, magnitude uncalibrated).",
         "CPCV fold design for selection-stage multiplicity (Agent 4 spec 2a).",
         "Licensed constituents/filing timestamps (retires 2 biggest APPROXes).",
-        "720-day IV tenors, cashflow_op, alternate buzz vectors (3/8 private alphas unevaluable).",
+        "Cashflow exact-variant gap (#3 sim +0.64 vs real +1.84; size-tailwind collision diagnosed, liqf untouched).",
+        "Sentiment level-fade vs drift-only edge (#5 sign mismatch; reversal leg refused on N=1).",
     ]
+    # Session changelog: hand-maintained, one entry per work session. This is
+    # the narrative layer machine-readable state cannot reconstruct (why
+    # decisions were made, what failed). Append, never rewrite history.
+    ctx["session_log"] = [
+        {"session": "calibration-bias",
+         "did": "Measured sim-vs-Brain bias on 8 pairs (Sharpe +1.81 optimistic); "
+                "built expected_real_adjustment + promotion 7th criterion; T2fb demo blocks as Brain did.",
+         "outcome": "landed, RR-27"},
+        {"session": "codebook-extension",
+         "did": "Mapped Brain reference to 39 matrix + 4 vector fields + market group; "
+                "identities over PIT parents; vec_mean/vec_std/vec_choose ops; "
+                "longest-match family voting (fixed cap/capex, open/opt_open collisions).",
+         "outcome": "landed, RR-30; 11 reference gaps closed (10 aliases + subindustry)"},
+        {"session": "rng-stream-incident",
+         "did": "A subindustry rng.integers() call placed mid-stream silently zeroed "
+                "the 2020 panic rate; caught by gate test, fixed with deterministic "
+                "mapping, verified bit-identical restoration.",
+         "outcome": "landed; rule: no RNG draws before downstream consumers except in declared order"},
+        {"session": "family-bias+slope",
+         "did": "Per-family bias envelopes (microstructure n=5 live, rest fallback); "
+                "turnover slope correction gated on >=4pts/>=30pp span; fixed logged "
+                "paren typo in one calibration record with annotation.",
+         "outcome": "landed, RR-28/29"},
+        {"session": "raw-vs-log+risk-lens",
+         "did": "Measured raw-vs-log at all 7 return use-sites: daily PnL exact in "
+                "simple returns (log would be wrong); added geometric CAGR reporting "
+                "(T2fb 14.70% linear vs 15.53% CAGR); 1+r>0 validator guard. Built "
+                "risk.py (hist VaR/ES, normal+t parametrics, conditional series, "
+                "exceedance backtest); first live read flagged MISCALIBRATED tails. "
+                "Per-alpha nu fitting (4.2-5.3, heavier than Remark-1 6); t-ES gap "
+                "predicts stress-DD ordering across 6 alphas.",
+         "outcome": "landed, RR-26; 74/74 tests at the time"},
+        {"session": "long-tenor-IV+cashflow+alt-sentiment",
+         "did": "Modeled 720d IV (sparser subset, term premium, wide skew), CFO-margin "
+                "AR(1)+PIT with cfo edge leg (quarterly block moved pre-edge, margin "
+                "stream preserved), independent scl12 process sharing drift edge. "
+                "Private #6 sim PASS reproduces real PASS (2.0/2.15 vs 1.30/1.07); "
+                "#3 null->+0.64 with diagnosed cap-scaler/size-tailwind collision; "
+                "#5 sign mismatch refused a reversal leg on N=1.",
+         "outcome": "landed, RR-31; 89/89 tests"},
+    ]
+    # Problems ledger: fixed (with how) vs open (with what's missing).
+    # Open RR entries are likewise derivable above; this is the short list.
+    ctx["problems"] = {
+        "fixed": [
+            {"what": "Sentiment sparsity false confidence (47% vs ~4% real)",
+             "how": "Recalibrated p_cov gradient + blackouts; T1 combo now fails synthetically as on real."},
+            {"what": "Turnover half-factor (2x undercount)",
+             "how": "Gross sum|dW| convention; E1 syn 33.14 vs real 33.33."},
+            {"what": "Truncation rescale violating cap (50% books)",
+             "how": "Plain clip, cap-strict, under-invests; verified at 5/10/20%."},
+            {"what": "Stale weight carry on thin days",
+             "how": "Flat-zero book; matches all surveyed engines."},
+            {"what": "Static lookahead universe mask",
+             "how": "Point-in-time trailing-252d sort; 13-18/500 daily misclassification removed."},
+            {"what": "Dead water-filling loop (comment claimed behavior code didn't have)",
+             "how": "Deleted loop, relabeled plain clip; behavior-identical verified."},
+            {"what": "Bootstrap recentering bug (would reject everything)",
+             "how": "Recenter by original means; caught by all-noise known-truth test."},
+            {"what": "Lexicographic Pareto comparison dropping valid candidates",
+             "how": "Elementwise 3D dominance; caught by unit test."},
+            {"what": "Dimension gate blind inside *//comparisons/wrappers",
+             "how": "Mandatory child recursion; rank(close*(sales-volume)) now flags."},
+            {"what": "RNG stream shift zeroing panic gate",
+             "how": "Deterministic subindustry mapping; bit-identical restoration verified."},
+            {"what": "PIT lookup 184s builds (nested-loop JOIN + row-wise inserts/assembly)",
+             "how": "Effective-knowledge single-inequality ASOF + UNNEST batching + vectorized assembly; ~15s builds."},
+            {"what": "Turnover churn misdiagnosed as base-process defect",
+             "how": "2x2 sweep proved decay-setting controls TO; churn package neutralized, comparisons must be decay-matched."},
+        ],
+        "open": [e["id"] + ": " + e["claim"] for e in rr["entries"]
+                 if e.get("status") == "open"],
+    }
+    # Standing orders: durable user directives. Do-not-violate list first.
+    ctx["standing_orders"] = {
+        "do_not": [
+            "Do NOT commit unless explicitly asked (say the word).",
+            "Do NOT push tokens or secrets into commands, files, or git config; "
+            "never ask for tokens — direct user to gh auth login / credential manager.",
+            "Do NOT loosen any gate to raise pass rates (CI enforces via GATE_VERSION).",
+            "Do NOT upload user-supplied private alphas to GitHub (gitignored private_records.jsonl).",
+            "Do NOT add RNG draws before downstream consumers without verifying stream stability.",
+            "Do NOT tune simulator constants on thin evidence (min 3 pairs for bias, 4pts/30pp for slopes).",
+            "Do NOT let cost/risk/high-fidelity lenses enter gates (diagnostic-only).",
+        ],
+        "do": [
+            "Verify every fix by execution (tests + measured numbers), never by reasoning alone.",
+            "Log every test including nulls; falsifiers stated up front with what would disprove.",
+            "Keep calibration pairs flowing: record real Brain results with full metrics incl. sub-sharpe + corr.",
+            "Update risk_register.json + rebuild context.json on material changes.",
+            "Prefer fixing root causes over adding machinery (subtraction before addition).",
+        ],
+    }
+    # Continuation prompt: paste context.json + this prompt into a fresh
+    # session to resume as if uninterrupted.
+    ctx["continue_prompt"] = (
+        "You are continuing the Fastexp project (C:\\Users\\at727\\Downloads\\Fastexp). "
+        "The attached context.json is the full project state — trust it over prior "
+        "assumptions, but verify cheap claims with tools before acting. Rules: "
+        "(1) read the open_tracks and session_log first; (2) never commit/push unless "
+        "explicitly asked, and never handle tokens; (3) verify every change by running "
+        "code (pytest suite must stay green) and report measured numbers, not reasoning; "
+        "(4) log null results and state falsifiers up front; (5) keep private alphas in "
+        "gitignored files only; (6) update risk_register.json and rebuild context.json "
+        "(python scripts/build_context.py) on material changes. "
+        "Start by running git status + pytest to confirm the tree matches context.json, "
+        "then state which open track you will work and your falsifiable plan."
+    )
     out = os.path.join(ROOT, "context.json")
     with open(out, "w") as f:
         json.dump(ctx, f, indent=2, default=str)
