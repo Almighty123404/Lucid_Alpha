@@ -47,5 +47,13 @@ def test_universe_kernel_parity_post_warmup(big_panel):
         dt = time.time() - t0
         assert b.shape == a.shape
         assert (a[20:] == b[20:]).all()  # exact where scores are distinct
-        assert b.sum(axis=1).max() <= int(u[3:])  # exact top-size membership
-        print(f"{u}: new={dt:.2f}s")
+    assert b.sum(axis=1).max() <= int(u[3:])  # exact top-size membership
+    print(f"{u}: new={dt:.2f}s")
+
+
+def test_topn_rows_clamps_bounds_and_excludes_nan():
+    from kernels import topn_rows
+    scores = np.array([[1.0, np.nan, 2.0, np.nan]])
+    assert topn_rows(scores, 99).tolist() == [[True, False, True, False]]
+    assert not topn_rows(scores, 0).any()
+    assert topn_rows(scores, -3).sum() == 0

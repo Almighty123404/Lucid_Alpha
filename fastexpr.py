@@ -5,7 +5,7 @@ class WQError(Exception):
     pass
 
 
-SYMBOLS = ['<=', '>=', '==', '!=', '<', '>', '+', '-', '*', '/', '^', '(', ')', ',', '&', '|', ';', '=']
+SYMBOLS = ['<=', '>=', '==', '!=', '<', '>', '+', '-', '*', '/', '^', '(', ')', ',', '&', '|', ';', '=', '?', ':']
 _PREC = {'|': 1, '&': 2, '<': 3, '>': 3, '<=': 3, '>=': 3, '==': 3, '!=': 3, '+': 4, '-': 4, '*': 5, '/': 5, '^': 6}
 
 
@@ -74,9 +74,23 @@ class Neg:
 
 
 class Parser:
+    # Depth guard: recursive descent burns ~9 C-stack frames per paren level,
+    # so Python's own limit (1000) trips near depth ~110 — the guard must sit
+    # well below that (100) to convert the crash into a catchable WQError.
+    # Brain parity: node caps exist downstream (GP NODE_CAP); the parser
+    # rejects first with a catchable WQError instead of raw RecursionError.
+    MAX_DEPTH = 100
+
     def __init__(self, toks):
         self.toks = toks
         self.i = 0
+        self.depth = 0
+
+    def _deeper(self):
+        self.depth += 1
+        if self.depth > self.MAX_DEPTH:
+            raise WQError(f"Expression nesting exceeds {self.MAX_DEPTH} levels")
+        return self.depth
 
     def peek(self):
         return self.toks[self.i]
@@ -94,11 +108,30 @@ class Parser:
         return t
 
     def parse(self):
-        node = self.or_expr()
+        node = self.ternary_expr()
         t = self.peek()
         if t[0] != 'EOF':
             raise WQError(f"Unexpected token '{t[1]}' at position {t[2]}")
         return node
+
+    def ternary_expr(self):
+        # C-style ternary, loosest precedence, right-associative. Desugars to
+        # the existing if_else(cond, a, b) call, inheriting its evaluator
+        # (elementwise np.where), arity check, and dimension rules. Missing
+        # ':' raises (no silent half-ternary). Depth-guarded here because all
+        # nesting (parens, call args, ?: chains) funnels through this method.
+        self._deeper()
+        try:
+            node = self.or_expr()
+            if self.peek()[:2] == ('SYM', '?'):
+                self.next()
+                a = self.ternary_expr()
+                self.expect('SYM', ':')
+                b = self.ternary_expr()
+                return Call('if_else', [node, a, b])
+            return node
+        finally:
+            self.depth -= 1
 
     def or_expr(self):
         node = self.and_expr()
@@ -136,20 +169,18 @@ class Parser:
         return node
 
     def unary(self):
-        t = self.peek()
-        if t[:2] == ('SYM', '-'):
-            self.next()
-            return Neg(self.unary())
-        if t[:2] == ('SYM', '+'):
-            self.next()
-            return self.unary()
-        return self.power()
+        signs = 0
+        while self.peek()[:2] in (('SYM', '-'), ('SYM', '+')):
+            if self.next()[1] == '-':
+                signs += 1
+        node = self.power()
+        return Neg(node) if signs % 2 else node
 
     def power(self):
         node = self.atom()
         if self.peek()[:2] == ('SYM', '^'):
             self.next()
-            return Bin('^', node, self.unary())
+            return Bin('^', node, self.power())
         return node
 
     def atom(self):
@@ -161,15 +192,15 @@ class Parser:
                 self.next()
                 args = []
                 if self.peek()[:2] != ('SYM', ')'):
-                    args.append(self.or_expr())
+                    args.append(self.ternary_expr())
                     while self.peek()[:2] == ('SYM', ','):
                         self.next()
-                        args.append(self.or_expr())
+                        args.append(self.ternary_expr())
                 self.expect('SYM', ')')
                 return Call(t[1], args)
             return Field(t[1])
         if t[:2] == ('SYM', '('):
-            node = self.or_expr()
+            node = self.ternary_expr()
             self.expect('SYM', ')')
             return node
         raise WQError(f"Unexpected token '{t[1]}' at position {t[2]}")
@@ -224,7 +255,7 @@ def parse_program(s):
         if (len(toks) >= 3 and toks[0][0] == 'ID' and toks[1][:2] == ('SYM', '=')):
             name = toks[0][1]
             sub = Parser(toks[2:])
-            node = sub.or_expr()
+            node = sub.ternary_expr()
             if sub.peek()[0] != 'EOF':
                 t = sub.peek()
                 raise WQError(f"Unexpected token '{t[1]}' at position {t[2]}")
@@ -518,6 +549,7 @@ def _arity(name, ev, lo, hi=None):
 def _arith(op, a, b, opname):
     if isinstance(a, (GroupVal, VectorVal)) or isinstance(b, (GroupVal, VectorVal)):
         raise WQError(f"Incompatible unit for input of '{opname}', expected Unit[Matrix]")
+    a, b = np.asarray(a), np.asarray(b)
     with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
         if op == '+':
             r = a + b
@@ -529,10 +561,12 @@ def _arith(op, a, b, opname):
             r = a / b
         else:
             r = np.power(a, b)
-    if isinstance(r, np.ndarray):
+    if isinstance(r, np.ndarray) and r.ndim:
         r = np.where(np.isinf(r), np.nan, r).astype(np.float64)
-    elif isinstance(r, float) and not np.isfinite(r):
-        r = float('nan')
+    else:
+        r = float(r)
+        if not np.isfinite(r):
+            r = float('nan')
     return r
 
 
@@ -552,7 +586,9 @@ def _compare(op, a, b, opname):
             r = a == b
         else:
             r = a != b
-    r = r.astype(np.float64)
+    # np.asarray (not .astype): scalar-vs-scalar comparisons yield Python
+    # bools, which have no astype (found via ternary degeneracy audit).
+    r = np.asarray(r, dtype=np.float64)
     if isinstance(a, np.ndarray):
         r[np.isnan(a)] = np.nan
     if isinstance(b, np.ndarray):
@@ -801,7 +837,11 @@ def _eval_call(node, env):
 
     if name == 'group_neutralize':
         _arity(name, ev, 2)
-        return _group_neutralize(_need_matrix(ev[0], name, env), _need_group(ev[1], name, env))
+        x = _need_matrix(ev[0], name, env)
+        g = _need_group(ev[1], name, env)
+        if g is None:
+            return np.full_like(x, np.nan, dtype=np.float64)
+        return _group_neutralize(x, g)
 
     if name == 'if_else':
         _arity(name, ev, 3)
@@ -847,9 +887,13 @@ def _eval_call(node, env):
         if not isinstance(v, VectorVal):
             raise WQError(f"Incompatible unit for input of '{name}', expected Unit[Vector]")
         k = ev[1]
-        if isinstance(k, np.ndarray):
+        if isinstance(k, np.ndarray) or not isinstance(k, (int, np.integer)):
             raise WQError(f"Incompatible unit for input of '{name}', expected scalar index")
-        k = int(k) % len(v.parts)
+        if not v.parts:
+            raise WQError("vec_choose cannot select from an empty vector")
+        k = int(k)
+        if not 0 <= k < len(v.parts):
+            raise WQError(f"vec_choose index {k} out of bounds [0, {len(v.parts) - 1}]")
         return np.asarray(v.parts[k], dtype=np.float64)
 
     if name in ('vector_neut', 'group_vector_neut'):
@@ -1077,9 +1121,9 @@ def _eval_call(node, env):
         a, b = ev
         if isinstance(a, (GroupVal, VectorVal)) or isinstance(b, (GroupVal, VectorVal)):
             raise WQError(f"Incompatible unit for input of '{name}', expected Unit[Matrix]")
-        ba, bb = _boolify(a), _boolify(b)
+        ba, bb = np.asarray(_boolify(a)), np.asarray(_boolify(b))
         r = (ba & bb) if name == 'and' else (ba | bb)
-        out = r.astype(np.float64)
+        out = np.asarray(r, dtype=np.float64)
         # strict: NaN in either input -> NaN
         if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
             out[np.isnan(a) | np.isnan(b)] = np.nan

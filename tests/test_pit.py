@@ -102,3 +102,45 @@ def test_revision_log_v2_backcompat_uniform():
     lags = [(np.datetime64(x['knowledge_ts']) - np.datetime64(x['period_end'])).astype(int) for x in rows if x['rev_seq'] == 1]
     assert min(lags) >= 20 and max(lags) <= 45
 
+
+def test_pit_rejects_unsorted_decisions_and_prefers_period_then_revision():
+    from pit import pit_asof
+    import pytest
+    with pytest.raises(ValueError, match="sorted"):
+        pit_asof([], np.array(['2020-02-02', '2020-02-01'], dtype='datetime64[D]'))
+    rows = [
+        {"sid": 0, "field": "x", "period_end": "2020-01-01", "knowledge_ts": "2020-01-10", "value": 10., "rev_seq": 1},
+        {"sid": 0, "field": "x", "period_end": "2020-02-01", "knowledge_ts": "2020-02-10", "value": 20., "rev_seq": 1},
+        {"sid": 0, "field": "x", "period_end": "2020-01-01", "knowledge_ts": "2020-03-01", "value": 11., "rev_seq": 2},
+        {"sid": 0, "field": "x", "period_end": "2020-02-01", "knowledge_ts": "2020-03-02", "value": 21., "rev_seq": 2},
+    ]
+    vals, _ = pit_asof(rows, np.array(['2020-03-03'], dtype='datetime64[D]'))
+    assert vals[0, 0] == 21.0
+
+
+
+def test_pit_connection_closed_on_query_failure():
+    import pit as _pit
+    closed = []
+    real_connect = _pit.duckdb.connect
+    class _Boom(Exception):
+        pass
+    class _FakeCon:
+        def execute(self, *a, **k):
+            raise _Boom()
+        def close(self):
+            closed.append(1)
+    _pit.duckdb.connect = lambda: _FakeCon()
+    import numpy as _np
+    rows = [{'sid': 0, 'field': 'x', 'period_end': '2020-01-01', 'knowledge_ts': '2020-02-01', 'value': 1.0, 'rev_seq': 1}]
+    days = _np.array(['2020-03-01'], dtype='datetime64[D]')
+    try:
+        import pytest as _pt
+        with _pt.raises(_Boom):
+            _pit.pit_asof(rows, days)
+        with _pt.raises(_Boom):
+            _pit.pit_asof_multi({'x': rows}, days)
+        assert closed == [1, 1]  # both paths release the connection
+    finally:
+        _pit.duckdb.connect = real_connect
+

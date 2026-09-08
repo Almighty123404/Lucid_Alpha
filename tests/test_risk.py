@@ -73,3 +73,20 @@ def test_risk_report_fits_nu_by_default(panel, refs):
     from simulator import simulate
     rep = simulate("ts_decay_linear(-ts_zscore(returns, 21), 10)", panel, refs, (), settings=None)
     assert 4.0 <= rep["risk"]["nu"] <= 30.0
+
+
+def test_trade_lens_textbook_and_guards():
+    import numpy as _np
+    from risk import trade_lens
+    rng = _np.random.default_rng(0)
+    x = rng.normal(0.001, 0.01, 1000)
+    r = trade_lens(x)
+    mu, dsd = x.mean(), x[x < 0].std(ddof=1)
+    assert abs(r['sortino'] - round(float(mu / dsd * _np.sqrt(252.0)), 4)) < 1e-9
+    assert r['hit_rate'] == round(float((x > 0).mean()), 4)
+    assert r['max_drawdown'] >= 0.0
+    g = trade_lens(_np.ones(50))
+    assert g['sortino'] == 0.0 and g['hit_rate'] == 1.0
+    assert trade_lens(_np.zeros(40))['sortino'] == 0.0
+    assert len(trade_lens(_np.ones(10))) == 1  # n<30 -> n_days only
+

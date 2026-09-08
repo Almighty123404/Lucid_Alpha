@@ -1,5 +1,5 @@
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 EDGE = {
     'rev5': -0.00045,
@@ -13,16 +13,17 @@ EDGE = {
     # Cashflow-yield level edge (user alpha #3). Calibrated once (2026-09-07):
     # 0.00012 puts the ts_rank(cashflow/cap) leg at clearly positive Sharpe
     # without dominating quality/momentum legs. Do NOT retune per-alpha.
+    'cfo': 0.00012,
     # PEAD drift edge (C5, added 2026-QFC review): post-announcement drift in
     # the direction of the revision surprise. Direction verified by A/B
     # (EDGE on vs off: revision-drift alpha +0.71 -> +1.63); magnitude
     # UNCALIBRATED (no real event-return shapes yet) — flagged like RR-11,
     # do NOT retune per-alpha.
     'pead': 0.00010,
-    # Cashflow-yield level edge (user alpha #3). Calibrated once (2026-09-07):
-    # 0.00012 puts the ts_rank(cashflow/cap) leg at clearly positive Sharpe
-    # without dominating quality/momentum legs. Do NOT retune per-alpha.
-    'cfo': 0.00012,
+    # Goodwill burden (SSRN-3292675: GTS negatively predicts, ~0.58%/mo
+    # long-short ≈ 1.4bps/day/z): direction-first like RR-11, magnitude
+    # UNCALIBRATED, do NOT retune per-alpha.
+    'goodwill': -0.00010,
 }
 
 REGIME = {2020: 1.5, 2021: 0.5, 2022: 1.0}
@@ -100,9 +101,46 @@ class Panel:
     # params). Empty string = unlogged provenance: any alpha evaluated on such
     # a panel is assigned DSR = 0 and blocked from promotion (see selection.py).
     dataset_id: str = ""
+    # Optional PIT provenance. Empty maps preserve legacy hand-built panels;
+    # generated panels populate publication grids for served fundamentals.
+    knowledge_ts: dict = field(default_factory=dict)
+    period_end: dict = field(default_factory=dict)
+    report_lag_days: dict = field(default_factory=dict)
 
 
-def fingerprint_panel(dates, fields, vector_fields, **params):
+def validate_panel_provenance(panel, require=False):
+    """Validate attached PIT publication metadata without changing lineage."""
+    if not panel.knowledge_ts:
+        if require:
+            raise ValueError("panel has no PIT provenance metadata")
+        return True
+    T, N = panel.fields['returns'].shape
+    decisions = panel.dates.astype('datetime64[D]')
+    for name, knowledge in panel.knowledge_ts.items():
+        if name not in panel.fields or np.asarray(knowledge).shape != (T, N):
+            raise ValueError(f"PIT knowledge shape missing/invalid for {name}")
+        k = np.asarray(knowledge).astype('datetime64[D]')
+        finite = np.isfinite(panel.fields[name])
+        bad = finite & ~(k <= decisions[:, None])
+        if bad.any():
+            t, s = np.argwhere(bad)[0]
+            raise ValueError(f"PIT knowledge violation {name} day {t} sid {s}")
+        lag = int(panel.report_lag_days.get(name, 0))
+        if lag < 0:
+            raise ValueError(f"negative PIT report lag for {name}")
+        period = panel.period_end.get(name)
+        if period is not None:
+            p = np.asarray(period).astype('datetime64[D]')
+            if p.shape != (T, N):
+                raise ValueError(f"PIT period_end shape invalid for {name}")
+            bad_period = finite & ~(p <= decisions[:, None] - np.timedelta64(lag, 'D'))
+            if bad_period.any():
+                t, s = np.argwhere(bad_period)[0]
+                raise ValueError(f"PIT period violation {name} day {t} sid {s}")
+    return True
+
+
+def fingerprint_panel(dates, fields, vector_fields, groups=None, subuniverse=None, **params):
     """Deterministic content fingerprint (hex sha256) for lineage logging."""
     import hashlib
     import json as _json
@@ -111,12 +149,24 @@ def fingerprint_panel(dates, fields, vector_fields, **params):
     for k in sorted(fields):
         v = np.ascontiguousarray(fields[k])
         h.update(k.encode() + str(v.shape).encode() + str(v.dtype).encode())
-        h.update(np.where(np.isfinite(v), v, 0.0).tobytes())
+        finite = np.isfinite(v)
+        h.update(finite.tobytes())
+        h.update(np.where(finite, v, 0.0).tobytes())
     for k in sorted(vector_fields):
         for p in vector_fields[k]:
             v = np.ascontiguousarray(p)
             h.update(k.encode() + str(v.shape).encode() + str(v.dtype).encode())
-            h.update(np.where(np.isfinite(v), v, 0.0).tobytes())
+            finite = np.isfinite(v)
+            h.update(finite.tobytes())
+            h.update(np.where(finite, v, 0.0).tobytes())
+    if groups is not None:
+        for k in sorted(groups):
+            v = np.ascontiguousarray(groups[k])
+            h.update(b"group:" + k.encode() + str(v.shape).encode() + str(v.dtype).encode())
+            h.update(v.tobytes())
+    if subuniverse is not None:
+        v = np.ascontiguousarray(np.asarray(subuniverse, dtype=np.bool_))
+        h.update(b"subuniverse:" + str(v.shape).encode() + v.tobytes())
     h.update(_json.dumps(params, sort_keys=True, default=str).encode())
     return h.hexdigest()
 
@@ -185,6 +235,11 @@ def _blackout_masks(rng, T, N, day_prob, min_cov, max_dur):
 
 
 def generate(seed=7, n_stocks=1000, start='2020-01-01', end='2022-12-31'):
+    if not isinstance(n_stocks, (int, np.integer)) or n_stocks < 2:
+        raise ValueError("n_stocks must be an integer >= 2")
+    start_d, end_d = np.datetime64(start, 'D'), np.datetime64(end, 'D')
+    if end_d < start_d:
+        raise ValueError("end must be on or after start")
     rng = np.random.default_rng(seed)
     all_days = np.arange(np.datetime64(start), np.datetime64(end) + np.timedelta64(1, 'D'), dtype='datetime64[D]')
     dates = all_days[np.is_busday(all_days)]
@@ -358,7 +413,12 @@ def generate(seed=7, n_stocks=1000, start='2020-01-01', end='2022-12-31'):
                     mu_e=np.clip(margin, 0.02, 0.40),
                     mu_c=np.clip(margin - 0.035, -0.25, 0.40),
                     mu_l=np.log(_lev_clip / (1.0 - _lev_clip)))
+    # Goodwill burden (SSRN-3292675): M&A-driven goodwill share as a STATIC
+    # firm characteristic drawn AFTER the generator (fork order preserved, so
+    # all current fundamental values stay byte-identical); served via PIT
+    # below so the edge leg funds post-publication drift (PEAD semantics).
     _fund = _genfund(_rng_fund, size, nq_pre, _fbar, _fparams)
+    _gw_share = _rng_fund.uniform(0.02, 0.25, N)
     margin_q = _fund["ebitda_q"] / np.maximum(_fund["sales_q"], 1e-12)
     # Phase 4 PIT: margins served knowledge-bounded (publication lag 20-45d +
     # 2% restatements) instead of calendar forward-fill with zero lag. Early
@@ -368,7 +428,7 @@ def generate(seed=7, n_stocks=1000, start='2020-01-01', end='2022-12-31'):
     _pe = np.array([dates[min((q + 1) * 63 - 1, T - 1)] for q in range(nq_pre)])
     _is_q4 = np.array([(q % 4 == 3) for q in range(nq_pre)])
     _mrows = _brl(_pe, margin_q, "margin", rng, liq_rank=liq_rank, is_q4=_is_q4)
-    margin_pit, _mkn = _asof(_mrows, dates)
+    margin_pit, _mkn, _mpe = _asof(_mrows, dates, return_provenance=True)
     _vpit(margin_pit, _mkn, dates)
     dmargin = np.diff(margin_pit, axis=0, prepend=margin_pit[:1])
     dm_z = np.nan_to_num(_cs_z(dmargin), nan=0.0)
@@ -394,22 +454,31 @@ def generate(seed=7, n_stocks=1000, start='2020-01-01', end='2022-12-31'):
     # C2/C3 at quarterly level: exact identity, 5% equity floor w/ rescale.
     _curr_lq = assets_q * liab_c[None, :]
     debt_q, _eq_q, _distress_q = _eqfloor(assets_q, assets_q * _fund["lev_q"], _curr_lq)
+    gw_q = assets_q * _gw_share[None, :]
     _pit4 = _asof_multi({"sales": _brl(_pe, sales_q, "sales", rng, liq_rank=liq_rank, is_q4=_is_q4),
                          "assets": _brl(_pe, assets_q, "assets", rng, liq_rank=liq_rank, is_q4=_is_q4),
                          "debt": _brl(_pe, debt_q, "debt", rng, liq_rank=liq_rank, is_q4=_is_q4, distress=_distress_q),
-                         "cashflow_op": _brl(_pe, cfo_q, "cashflow_op", rng, liq_rank=liq_rank, is_q4=_is_q4, distress=_distress_q)}, dates)
-    sales, _skn = _pit4["sales"]
-    assets, _akn = _pit4["assets"]
-    debt, _dkn = _pit4["debt"]
-    cashflow_op, _ckn = _pit4["cashflow_op"]
+                         "cashflow_op": _brl(_pe, cfo_q, "cashflow_op", rng, liq_rank=liq_rank, is_q4=_is_q4, distress=_distress_q),
+                         "goodwill": _brl(_pe, gw_q, "goodwill", rng, liq_rank=liq_rank, is_q4=_is_q4)}, dates,
+                         return_provenance=True)
+    sales, _skn, _spe = _pit4["sales"]
+    assets, _akn, _ape = _pit4["assets"]
+    debt, _dkn, _dpe = _pit4["debt"]
+    cashflow_op, _ckn, _cpe = _pit4["cashflow_op"]
+    goodwill_pit, _gwkn, _gwpe = _pit4["goodwill"]
     _vpit(sales, _skn, dates)
     _vpit(assets, _akn, dates)
     _vpit(debt, _dkn, dates)
     _vpit(cashflow_op, _ckn, dates)
+    _vpit(goodwill_pit, _gwkn, dates)
     # Cashflow-yield level exposure (user alpha #3 trades ts_rank(cashflow/cap)):
     # NaN-safe like fmom (unknown early days contribute zero, never NaN).
     _cfy = np.nan_to_num(_cs_z(np.where(np.isfinite(assets) & (assets != 0),
                                         cashflow_op / np.maximum(assets, 1e-12), np.nan)), nan=0.0)
+    # Goodwill-burden level exposure (SSRN-3292675 direction): long LOW
+    # goodwill-to-sales. NaN-safe like _cfy.
+    _gw = np.nan_to_num(_cs_z(np.where(np.isfinite(sales) & (sales != 0),
+                                       goodwill_pit / np.maximum(sales, 1e-12), np.nan)), nan=0.0)
     ebitda = sales * margin_pit
     assets_curr = assets * curr_a[None, :]
     liabilities_curr = assets * liab_c[None, :]
@@ -423,6 +492,7 @@ def generate(seed=7, n_stocks=1000, start='2020-01-01', end='2022-12-31'):
             + EDGE['lowvol'] * (-lowvol_z)
             + EDGE['lev'] * lev_z[None, :] * liqf
             + EDGE['cfo'] * _cfy * liqf
+            + EDGE['goodwill'] * _gw * liqf
             + EDGE['fmom'] * fmom_z
             + EDGE['pead'] * pead_z) * regime
 
@@ -444,6 +514,12 @@ def generate(seed=7, n_stocks=1000, start='2020-01-01', end='2022-12-31'):
     cap = shares_out[None, :] * close
 
     iv_base = rv20 * np.sqrt(252.0) * 100.0 * (1.05 + rng.normal(0.0, 0.08, (T, N))) + 8.0
+    # GK evaluated and REVERTED (2026-QFC review): Garman-Klass on synthetic
+    # bars moved VRP only +0.6 (level-identical estimator here — synthetic
+    # overnight gaps are toy N(0,0.004) noise, so GK earns no keep) while
+    # regressing validated #6 fitness 1.27->0.80 across its gate. rv20 stays
+    # the anchor; GK lives on only in real_data.py where genuine overnight
+    # gaps exist. No RNG impact either way (pure transforms).
     # C6 SSVI rewire (sticky-ratio puts, fixed 2026-QFC review): calls are
     # arbitrage-free ATM slices; puts = ATM slice x (1 + s_i) with STATIC
     # per-name relative wing markup s_i from the SSVI surface at mean theta.
@@ -577,7 +653,9 @@ def generate(seed=7, n_stocks=1000, start='2020-01-01', end='2022-12-31'):
     equity = assets - liabilities
     cash_and_equiv = assets_curr * 0.3
     retained_earnings = equity * 0.4
-    goodwill = assets * 0.1
+    # Single source: codebook goodwill IS the PIT-served series (replaces the
+    # dead assets*0.1 constant that carried zero cross-sectional information).
+    goodwill = goodwill_pit
     working_capital = assets_curr - liabilities_curr
     # C5 single cash-flow truth: the PIT-served cashflow_op IS operating cash
     # flow (killed the parallel ebitda*0.9 series that alpha #3 never traded).
@@ -612,9 +690,28 @@ def generate(seed=7, n_stocks=1000, start='2020-01-01', end='2022-12-31'):
     short_interest = np.where(_fin, shares_out[None, :] * _short_frac, np.nan)
     days_to_cover = np.where(_fin, (short_interest * close) / np.maximum(adv20, 1e-12), np.nan)
     borrow_fee = np.clip(0.0025 + _short_frac * 0.5 + rng.normal(0.0, 0.002, (T, N)), 0.0025, None)
-    _ins = rng.random((T, N)) < 0.02
-    insider_buying = np.where(_ins & _fin, np.abs(rng.normal(0.0, 1.0, (T, N))) * size[None, :] * 1e-4, 0.0)
-    insider_selling = np.where(_ins & _fin, -np.abs(rng.normal(0.0, 1.0, (T, N))) * size[None, :] * 1e-4, 0.0)
+    # Anticipatory insider (SSRN-278055): selling intensity triples where the
+    # trailing 63d served-margin change sits in the cross-sectional bottom
+    # quartile (deterioration insiders "know" pre-break). Buys stay uniform.
+    # Same draw COUNT as before (one uniform + two normals) — zero stream
+    # impact elsewhere; mean sell rate preserved (~0.0175 vs 0.02).
+    _det = margin_pit - np.roll(margin_pit, 63, axis=0)
+    _det[:63] = 0.0
+    _detf = np.where(np.isfinite(_det), _det, np.nan)
+    _has = np.isfinite(_detf).sum(axis=1) > 0
+    _q25 = np.zeros(T)
+    _q25[_has] = np.nanquantile(_detf[_has], 0.25, axis=1)
+    _sell_p = 0.01 + 0.03 * (np.isfinite(_det) & (_det < _q25[:, None]))
+    _ins = rng.random((T, N))
+    insider_buying = np.where((_ins < 0.02) & _fin, np.abs(rng.normal(0.0, 1.0, (T, N))) * size[None, :] * 1e-4, 0.0)
+    insider_selling = np.where((_ins < _sell_p) & _fin, -np.abs(rng.normal(0.0, 1.0, (T, N))) * size[None, :] * 1e-4, 0.0)
+    # Structural codebook legs (review #41-44): SG&A share + non-operating
+    # wedge as STATIC firm characteristics drawn TRAILING (zero upstream
+    # stream impact); levels from PIT-served parents so timing is inherited.
+    _sga_share = rng.uniform(0.10, 0.30, N)
+    _ebit_wedge = rng.normal(0.0, 0.005, N)
+    operating_expense = cogs + sales * _sga_share[None, :]
+    ebit = operating_income + sales * _ebit_wedge[None, :]
     fields = {
         'close': close,
         'open': open_,
@@ -646,6 +743,8 @@ def generate(seed=7, n_stocks=1000, start='2020-01-01', end='2022-12-31'):
         'operating_income': operating_income,
         'net_income': net_income,
         'return_assets': return_assets,
+        'operating_expense': operating_expense,
+        'ebit': ebit,
         'eps': eps,
         'tax_expense': tax_expense,
         'liabilities': liabilities,
@@ -715,8 +814,16 @@ def generate(seed=7, n_stocks=1000, start='2020-01-01', end='2022-12-31'):
     panel = Panel(dates=dates, fields=fields, vector_fields=vector_fields,
                   groups=groups, subuniverse=subuniverse,
                   dataset_id=fingerprint_panel(dates, fields, vector_fields,
-                                               seed=seed, n_stocks=N,
-                                               start=str(start), end=str(end)))
+                                                seed=seed, n_stocks=N,
+                                                start=str(start), end=str(end),
+                                                groups=groups, subuniverse=subuniverse),
+                  knowledge_ts={'sales': _skn, 'assets': _akn,
+                                'debt': _dkn, 'cashflow_op': _ckn,
+                                'goodwill': _gwkn},
+                  period_end={'sales': _spe, 'assets': _ape, 'debt': _dpe,
+                              'cashflow_op': _cpe, 'goodwill': _gwpe},
+                  report_lag_days={'sales': 0, 'assets': 0,
+                                   'debt': 0, 'cashflow_op': 0, 'goodwill': 0})
     validate_panel(panel)
     return panel
 # Field staleness (institutional data-integrity note, Phase 2): daily =
@@ -752,7 +859,7 @@ def validate_panel(panel):
            'tax_expense', 'liabilities', 'equity', 'cash_and_equiv',
            'retained_earnings', 'goodwill', 'working_capital',
            'operating_cash_flow', 'capex', 'free_cash_flow', 'dividends_paid',
-           'return_assets',
+           'return_assets', 'operating_expense', 'ebit',
            'est_eps', 'est_revenue', 'est_eps_std', 'recommendation',
            'eps_surprise', 'snt_news', 'snt_social', 'news_volume',
            'iv_10', 'iv_30', 'hv_20', 'put_call_ratio', 'opt_open_interest',
@@ -764,9 +871,20 @@ def validate_panel(panel):
     if missing:
         raise ValueError(f"panel missing fields: {sorted(missing)}")
     T, N = panel.fields['returns'].shape
+    if T <= 20 or N < 2:
+        raise ValueError("panel requires at least 21 dates and 2 instruments")
     for k, v in panel.fields.items():
         if v.shape != (T, N):
             raise ValueError(f"field {k} shape {v.shape} != ({T},{N})")
+    for k, parts in panel.vector_fields.items():
+        if not parts:
+            raise ValueError(f"vector field {k} has no parts")
+        for i, part in enumerate(parts):
+            if np.asarray(part).shape != (T, N):
+                raise ValueError(f"vector {k}[{i}] shape {np.asarray(part).shape} != ({T},{N})")
+    for k, group in panel.groups.items():
+        if np.asarray(group).shape != (N,):
+            raise ValueError(f"group {k} shape {np.asarray(group).shape} != ({N},)")
     if not bool((np.diff(panel.dates.astype('datetime64[D]').astype(int)) > 0).all()):
         raise ValueError("panel dates not strictly increasing")
     if float(np.isfinite(panel.fields['close']).mean()) < 0.95:
@@ -776,7 +894,8 @@ def validate_panel(panel):
     # is a generator bug, not a market event.
     if bool((panel.fields['returns'][np.isfinite(panel.fields['returns'])] <= -1.0).any()):
         raise ValueError("returns at/below -100% would break price compounding")
-    if float(np.isfinite(panel.fields['adv20'][20:]).mean()) < 0.90:
+    adv_slice = np.isfinite(panel.fields['adv20'][20:])
+    if not adv_slice.size or float(adv_slice.mean()) < 0.90:
         raise ValueError("adv20 coverage below 90% past 20d warmup")
     KEL = np.isfinite(panel.fields['close']).sum(axis=1)
     if int((KEL == 0).sum()) > 0:

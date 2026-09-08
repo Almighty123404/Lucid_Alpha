@@ -104,11 +104,15 @@ def generate_real_panel(seed=7, n_stocks=200, start="2020-01-01", end="2022-12-3
         tickers = list(tickers)[:n_stocks]
 
     if cache_path is None:
-        safe = f"{start}_{end}_{len(tickers)}"
+        import hashlib
+        ticker_key = hashlib.sha256(",".join(sorted(tickers)).encode()).hexdigest()[:12]
+        safe = f"{start}_{end}_{len(tickers)}_{ticker_key}"
         cache_path = os.path.join(os.path.dirname(__file__), "cache", f"yfinance_{safe}.pkl")
     if use_cache and os.path.exists(cache_path):
         with open(cache_path, "rb") as f:
             cached = pickle.load(f)
+        if sorted(cached.get("tickers", [])) != sorted(tickers):
+            raise ValueError("real-data cache ticker metadata does not match request")
         dates, cols, kept = cached["dates"], cached["cols"], cached["tickers"]
     else:
         dates, cols, kept = _download_ohlcv(tickers, start, end)
@@ -163,6 +167,15 @@ def generate_real_panel(seed=7, n_stocks=200, start="2020-01-01", end="2022-12-3
     med_rv = np.nanmedian(rv20, axis=0)
     rv20 = np.where(np.isfinite(rv20), rv20, med_rv)
     iv_base = rv20 * np.sqrt(252.0) * 100.0 * (1.05 + rng.normal(0.0, 0.08, (T, N))) + 8.0
+    # GK anchor mirrors data_gen (range estimator on executed OHLC; rv20 stays
+    # close-based for hv_20 definition stability). Real OHLC includes genuine
+    # overnight gaps, so GK earns its keep here more than on synthetic bars.
+    from iv_surface import garman_klass_estimate as _gk
+    from data_gen import _roll_mean as _rm
+    _gk_ann = np.sqrt(_rm(np.where(np.isfinite(close),
+                                   _gk(open_, high, low, close) ** 2, np.nan), 20))
+    _gk_ann = np.where(np.isfinite(_gk_ann), _gk_ann, np.nanmedian(_gk_ann, axis=0))
+    iv_base = _gk_ann * np.sqrt(252.0) * 100.0 * (1.05 + rng.normal(0.0, 0.08, (T, N))) + 8.0
     # C6 SSVI mirror (see data_gen): arbitrage-free slices, not ad-hoc
     # multiples. Asymmetry (documented): no regime mult here — realized real
     # vols already embed crises (crisis=zeros); data_gen scales its synthetic
@@ -244,12 +257,13 @@ def generate_real_panel(seed=7, n_stocks=200, start="2020-01-01", end="2022-12-3
                  "margin": _brl(_pe, margin_q, "margin", rng, liq_rank=liq_rank, is_q4=_is_q4),
                  "assets": _brl(_pe, assets_q, "assets", rng, liq_rank=liq_rank, is_q4=_is_q4),
                  "debt": _brl(_pe, debt_q, "debt", rng, liq_rank=liq_rank, is_q4=_is_q4, distress=_distress_q),
-                 "cashflow_op": _brl(_pe, cfo_q, "cashflow_op", rng, liq_rank=liq_rank, is_q4=_is_q4, distress=_distress_q)}, dates)
-    sales, _skn = _pit4["sales"]
-    _marg_pit, _mkn = _pit4["margin"]
-    assets, _akn = _pit4["assets"]
-    debt, _dkn = _pit4["debt"]
-    cashflow_op, _ckn = _pit4["cashflow_op"]
+                 "cashflow_op": _brl(_pe, cfo_q, "cashflow_op", rng, liq_rank=liq_rank, is_q4=_is_q4, distress=_distress_q)}, dates,
+                 return_provenance=True)
+    sales, _skn, _spe = _pit4["sales"]
+    _marg_pit, _mkn, _mpe = _pit4["margin"]
+    assets, _akn, _ape = _pit4["assets"]
+    debt, _dkn, _dpe = _pit4["debt"]
+    cashflow_op, _ckn, _cpe = _pit4["cashflow_op"]
     _vpit(sales, _skn, dates)
     _vpit(_marg_pit, _mkn, dates)
     _vpit(assets, _akn, dates)
@@ -317,7 +331,8 @@ def generate_real_panel(seed=7, n_stocks=200, start="2020-01-01", end="2022-12-3
     equity = assets - liabilities
     cash_and_equiv = assets_curr * 0.3
     retained_earnings = equity * 0.4
-    goodwill = assets * 0.1
+    # Goodwill burden mirror: dispersed share (static), timing via served assets.
+    goodwill = assets * rng.uniform(0.02, 0.25, N)[None, :]
     working_capital = assets_curr - liabilities_curr
     # C5 single cash-flow truth (mirrors data_gen): PIT-served cashflow_op.
     operating_cash_flow = cashflow_op
@@ -325,6 +340,11 @@ def generate_real_panel(seed=7, n_stocks=200, start="2020-01-01", end="2022-12-3
     free_cash_flow = operating_cash_flow - capex
     dividends_paid = np.maximum(net_income, 0.0) * 0.3
     return_assets = net_income / np.maximum(assets, 1e-12)  # G1 mirror
+    # Structural legs mirror data_gen (same distributions; stream not pinned).
+    _sga_share = rng.uniform(0.10, 0.30, N)
+    _ebit_wedge = rng.normal(0.0, 0.005, N)
+    operating_expense = cogs + sales * _sga_share[None, :]
+    ebit = operating_income + sales * _ebit_wedge[None, :]
     est_eps = eps * 4.0 * (1.0 + rng.normal(0.0, 0.03, (T, N)))
     est_revenue = sales * 4.0 * (1.0 + rng.normal(0.0, 0.03, (T, N)))
     est_eps_std = np.abs(est_eps) * 0.15
@@ -342,10 +362,18 @@ def generate_real_panel(seed=7, n_stocks=200, start="2020-01-01", end="2022-12-3
     short_interest = np.where(_fin, _shares * _short_frac, np.nan)
     days_to_cover = np.where(_fin, (short_interest * close) / np.maximum(adv20, 1e-12), np.nan)
     borrow_fee = np.clip(0.0025 + _short_frac * 0.5 + rng.normal(0.0, 0.002, (T, N)), 0.0025, None)
-    _ins = rng.random((T, N)) < 0.02
+    # Anticipatory insider mirror (SSRN-278055): deterioration-loaded selling.
+    _det = _marg_pit - np.roll(_marg_pit, 63, axis=0)
+    _det[:63] = 0.0
+    _detf = np.where(np.isfinite(_det), _det, np.nan)
+    _has = np.isfinite(_detf).sum(axis=1) > 0
+    _q25 = np.zeros(T)
+    _q25[_has] = np.nanquantile(_detf[_has], 0.25, axis=1)
+    _sell_p = 0.01 + 0.03 * (np.isfinite(_det) & (_det < _q25[:, None]))
+    _ins = rng.random((T, N))
     _sz = np.nanmean(dollar_vol, axis=0, keepdims=True)
-    insider_buying = np.where(_ins & _fin, np.abs(rng.normal(0.0, 1.0, (T, N))) * _sz * 1e-4, 0.0)
-    insider_selling = np.where(_ins & _fin, -np.abs(rng.normal(0.0, 1.0, (T, N))) * _sz * 1e-4, 0.0)
+    insider_buying = np.where((_ins < 0.02) & _fin, np.abs(rng.normal(0.0, 1.0, (T, N))) * _sz * 1e-4, 0.0)
+    insider_selling = np.where((_ins < _sell_p) & _fin, -np.abs(rng.normal(0.0, 1.0, (T, N))) * _sz * 1e-4, 0.0)
     _est_q = [est_eps * (1.0 + (q + 1) * 0.02 + rng.normal(0.0, 0.02, (T, N))) for q in range(4)]
     _skew_mid = np.where(np.isfinite(call_60) & np.isfinite(put_60), (call_60 + put_60) / 2.0, np.nan)
     _surf = [put_60 * 1.15, put_60 * 1.05, _skew_mid, call_60 * 1.05, call_60 * 1.15]
@@ -370,7 +398,7 @@ def generate_real_panel(seed=7, n_stocks=200, start="2020-01-01", end="2022-12-3
         "retained_earnings": retained_earnings, "goodwill": goodwill,
         "working_capital": working_capital, "operating_cash_flow": operating_cash_flow,
         "capex": capex, "free_cash_flow": free_cash_flow, "dividends_paid": dividends_paid,
-        "return_assets": return_assets,
+        "return_assets": return_assets, "operating_expense": operating_expense, "ebit": ebit,
         "est_eps": est_eps, "est_revenue": est_revenue, "est_eps_std": est_eps_std,
         "recommendation": recommendation, "eps_surprise": eps_surprise,
         "snt_news": snt_news, "snt_social": snt_social, "news_volume": news_volume,
@@ -395,9 +423,16 @@ def generate_real_panel(seed=7, n_stocks=200, start="2020-01-01", end="2022-12-3
     n_sub = max(1, int(N * 0.5))
     subuniverse = liq_rank >= np.sort(liq_rank)[-n_sub]
 
-    panel = Panel(dates=dates, fields=fields, vector_fields=vector_fields, groups=groups, subuniverse=subuniverse)
+    panel = Panel(dates=dates, fields=fields, vector_fields=vector_fields, groups=groups, subuniverse=subuniverse,
+                  knowledge_ts={'sales': _skn, 'assets': _akn,
+                                'debt': _dkn, 'cashflow_op': _ckn},
+                  period_end={'sales': _spe, 'assets': _ape,
+                              'debt': _dpe, 'cashflow_op': _cpe},
+                  report_lag_days={'sales': 0, 'margin': 0, 'assets': 0,
+                                   'debt': 0, 'cashflow_op': 0})
     panel.tickers = kept
     validate_panel(panel)  # Phase 2: fail loudly on malformed panels
-    panel.dataset_id = fingerprint_panel(dates, fields, vector_fields, backend="yfinance",
+    panel.dataset_id = fingerprint_panel(dates, fields, vector_fields, groups=groups,
+                                         subuniverse=subuniverse, backend="yfinance",
                                          tickers=kept, start=str(start), end=str(end), seed=seed)
     return panel

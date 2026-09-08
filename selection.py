@@ -16,6 +16,9 @@ Pieces:
 import json
 import math
 import os
+import logging
+import time
+from contextlib import contextmanager
 from itertools import combinations
 
 import numpy as np
@@ -24,6 +27,7 @@ TRIALS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            'reports', 'trials.jsonl')
 AUTO_LOG = True  # simulate() logs every trial; tests set False or redirect
 SCOPE = "default"  # research-question namespace for N_trials multiplicity.
+_LOG = logging.getLogger(__name__)
 # Multiplicity is only meaningful within one search: campaign trials must not
 # tax competition candidates or vice versa. Entry points set this once
 # (competition -> "competition", gp_campaign -> "gp-campaign", walkforward ->
@@ -94,30 +98,69 @@ class TrialRegistry:
     def __init__(self, path=None):
         self.path = path or TRIALS_PATH
 
+    @contextmanager
+    def _lock(self, timeout=10.0):
+        """Cross-process sidecar lock for JSONL readers/writers."""
+        directory = os.path.dirname(self.path) or "."
+        os.makedirs(directory, exist_ok=True)
+        lock_path = self.path + ".lock"
+        started = time.monotonic()
+        fd = None
+        while fd is None:
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode())
+            except FileExistsError:
+                if time.monotonic() - started >= timeout:
+                    try:
+                        if time.time() - os.path.getmtime(lock_path) > timeout:
+                            os.remove(lock_path)
+                            continue
+                    except OSError:
+                        pass
+                    raise TimeoutError(f"trial registry lock timeout: {self.path}")
+                time.sleep(0.01)
+        try:
+            yield
+        finally:
+            if fd is not None:
+                os.close(fd)
+            try:
+                os.remove(lock_path)
+            except FileNotFoundError:
+                pass
+
     def log(self, skeleton, dataset_id, settings, sharpe, fitness, passed,
             scope=None):
         try:
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            with open(self.path, "a") as f:
-                f.write(json.dumps({"skeleton": skeleton, "dataset_id": dataset_id,
-                                    "settings": settings, "sharpe": sharpe,
-                                    "fitness": fitness, "passed": bool(passed),
-                                    "scope": scope or SCOPE},
-                                   default=str) + "\n")
-        except OSError:
-            pass
+            with self._lock():
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"skeleton": skeleton, "dataset_id": dataset_id,
+                                        "settings": settings, "sharpe": sharpe,
+                                        "fitness": fitness, "passed": bool(passed),
+                                        "scope": scope or SCOPE},
+                                       default=str) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+            return True
+        except (OSError, TimeoutError) as exc:
+            _LOG.warning("trial_registry_write_failed path=%s error=%s", self.path, type(exc).__name__)
+            return False
 
     def _iter(self):
         try:
-            with open(self.path) as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            yield json.loads(line)
-                        except ValueError:
-                            continue
-        except OSError:
+            with self._lock():
+                with open(self.path, encoding="utf-8") as f:
+                    rows = f.readlines()
+            for line in rows:
+                line = line.strip()
+                if line:
+                    try:
+                        yield json.loads(line)
+                    except ValueError:
+                        _LOG.warning("trial_registry_malformed_line path=%s", self.path)
+        except (OSError, TimeoutError):
+            _LOG.warning("trial_registry_read_failed path=%s", self.path)
             return
 
     def count(self, dataset_id=None, scope="default"):
@@ -196,6 +239,10 @@ def promotion_eligible(rep, registry, dstar=DSR_PROMOTE, scope="default",
                   and adj.get("fitness", -99) > _gc("fitness_min")):
             reasons.append(f"expected-real check failed: adj Sharpe {adj.get('sharpe')} / "
                            f"Fitness {adj.get('fitness')} below cutoffs")
+        elif not (_gc("turnover_min") <= adj.get("turnover_pct", -1.0) / 100.0
+                  <= _gc("turnover_max")):
+            reasons.append(f"expected-real turnover failed: {adj.get('turnover_pct')}% "
+                           f"outside {_gc('turnover_min') * 100:.0f}%-{_gc('turnover_max') * 100:.0f}%")
     if peer_pnls:
         ok, detail = portfolio_screen(list(pnl), [list(p) for p in peer_pnls],
                                       alpha_fw=alpha_fw)

@@ -14,7 +14,7 @@ import warnings
 import numpy as np
 
 from fastexpr import parse, parse_program, eval_node, eval_program, Env, WQError
-from config import (SimulationSettings, DEFAULT_SETTINGS, DEFAULT_EXECUTION, CUTOFFS as _CFG_CUTOFFS,
+from config import (SimulationSettings, ExecutionSettings, DEFAULT_SETTINGS, DEFAULT_EXECUTION, CUTOFFS as _CFG_CUTOFFS,
                     get_cutoff, subuniverse_cutoff, UNIVERSES)
 
 warnings.filterwarnings('ignore')
@@ -292,30 +292,61 @@ def _roll_std_plain(x, w, min_obs=5):
     return np.where(C >= min_obs, np.sqrt(var), 0.0)
 
 
-def _high_fidelity_report(Wd, R, adv, exec_cfg, book_size=1.0, annualization=252.0):
+def _high_fidelity_report(Wd, R, adv, exec_cfg, borrow_fee=None, book_size=1.0, annualization=252.0):
     """High-Fidelity execution lens (Phase 2, Agent 1 blueprint). DIAGNOSTIC
     ONLY — never enters gates until calibrated against real shortfall.
 
-    Mechanics (all elementwise, vectorized): participation = |dW|*book/ADV;
+    Mechanics (all elementwise, vectorized): participation = |order|/ADV;
     FIFO back-of-queue proxy fill = min(1, max_participation/participation)
-    (names with no liquidity print are unfillable unless dW == 0); filled
-    trades rebuild an effective weight path; costs = spread*urgency +
+    (names with no liquidity print are unfillable unless the order is zero).
+    Wd[0] is an explicitly inherited initial holding, so no initial order is
+    generated; subsequent orders are target minus the effective position.
+    Filled trades rebuild that effective position; costs = spread*urgency +
     commission (bps on filled notional) + Almgren-Chriss permanent
     (sqrt-law) + temporary (linear-in-rate) from 20d rolling sigma.
-    Unfilled weight is dropped and counted as shortfall (working-order
-    persistence is out of scope for the daily-bar model).
+    Unfilled orders remain outstanding through the effective-position
+    reconciliation on the next day; working-order persistence beyond that
+    daily reconciliation is out of scope.
     """
     T, N = Wd.shape
-    dW = np.diff(Wd, axis=0, prepend=np.zeros((1, N)))
-    adv_ok = (np.isfinite(adv) & (adv > 0)) if adv is not None else np.zeros_like(dW, dtype=bool)
-    need = np.abs(dW) > 1e-12
-    part = np.where(need & adv_ok, np.abs(dW) * book_size / np.maximum(adv, 1e-12), 0.0)
-    part = np.where(need & ~adv_ok, np.inf, part)
-    fill = np.where(need, np.minimum(1.0, float(exec_cfg["max_participation"]) / np.maximum(part, 1e-12)), 1.0)
-    dWf = dW * fill
-    Wfd = np.cumsum(dWf, axis=0)
+    # Dollarize once: all participation/cost accounting runs in currency
+    # against dollar ADV (audit: impact leg previously used book units while
+    # participation used notional — dimensionally inconsistent). Turnover
+    # reporting stays in weight units (divided back at the end).
+    scale = (float(exec_cfg['portfolio_notional']) / book_size
+             if exec_cfg.get('portfolio_notional') is not None else 1.0)
+    Wd = Wd * scale
+    notional = (float(exec_cfg['portfolio_notional'])
+                if exec_cfg.get('portfolio_notional') is not None else book_size)
+    target = Wd
+    liquidity = (np.asarray(adv, dtype=np.float64)
+                 if adv is not None else np.zeros_like(target))
+    adv_ok = np.isfinite(liquidity) & (liquidity > 0)
+    # Convention: the first target is the inherited starting position. This
+    # preserves the initial target instead of silently dropping it.
+    effective = np.zeros_like(target)
+    effective[0] = target[0]
+    order = np.zeros_like(target)
+    dWf = np.zeros_like(target)
+    fill = np.ones_like(target)
+    for t in range(1, T):
+        order[t] = target[t] - effective[t - 1]
+        need_t = np.abs(order[t]) > 1e-12 * scale
+        part_t = np.where(need_t & adv_ok[t],
+                          np.abs(order[t]) / np.maximum(liquidity[t], 1e-12), 0.0)
+        part_t = np.where(need_t & ~adv_ok[t], np.inf, part_t)
+        fill[t] = np.where(
+            need_t,
+            np.minimum(1.0, float(exec_cfg["max_participation"])
+                       / np.maximum(part_t, 1e-12)),
+            1.0,
+        )
+        dWf[t] = order[t] * fill[t]
+        effective[t] = effective[t - 1] + dWf[t]
+    Wfd = effective
+    need = np.abs(order) > 1e-12 * scale
     sigma = _roll_std_plain(R, 20)
-    pf = np.where(need & adv_ok, np.abs(dWf) * book_size / np.maximum(adv, 1e-12), 0.0)
+    pf = np.where(need & adv_ok, np.abs(dWf) / np.maximum(liquidity, 1e-12), 0.0)
     bps = (float(exec_cfg["spread_bps"]) * float(exec_cfg["urgency"])
            + float(exec_cfg["commission_bps"])) / 1e4
     imp = (float(exec_cfg["lambda_perm"]) * sigma * np.power(np.maximum(pf, 0.0), float(exec_cfg["alpha"]))
@@ -324,28 +355,91 @@ def _high_fidelity_report(Wd, R, adv, exec_cfg, book_size=1.0, annualization=252
     cost = cost_cell.sum(axis=1)
     gross = np.zeros(T)
     gross[1:] = (Wfd[:-1] * R[1:]).sum(axis=1)
-    net = gross - cost
+    if borrow_fee is not None:
+        bf = np.asarray(borrow_fee, dtype=np.float64)
+        if bf.shape != Wd.shape:
+            raise ValueError("borrow_fee must match weight shape")
+        borrow = (np.maximum(-Wfd, 0.0) * np.maximum(bf, 0.0) / annualization).sum(axis=1)
+    else:
+        borrow = np.zeros(T)
+    net = gross - cost - borrow
     sd = net[1:].std()
     sharpe = float(net[1:].mean() / sd * np.sqrt(annualization)) if sd > 1e-12 else 0.0
-    to_f = float(np.abs(dWf[1:]).sum(axis=1).mean()) if T > 1 else 0.0
-    invested = book_size / 2.0
+    to_f = float(np.abs(dWf[1:]).sum(axis=1).mean() / scale) if T > 1 else 0.0
+    invested = notional / 2.0
     ret_ann = float(net[1:].mean() * annualization / invested) if invested > 0 else 0.0
     fit_floor = 0.125
     fitness = float(sharpe * np.sqrt(abs(ret_ann) / max(to_f, fit_floor)))
-    intended = float(np.abs(dW[1:]).sum())
+    intended = float(np.abs(order[1:]).sum())
     filled = float(np.abs(dWf[1:]).sum())
-    wsum = float(np.abs(Wd).sum())
-    wfsum = float(np.abs(Wfd).sum())
+    fill_rate = min(max(filled / intended, 0.0), 1.0) if intended > 1e-12 else 1.0
     return {
         'net_sharpe': round(sharpe, 4),
         'net_fitness': round(fitness, 4),
         'net_returns_pct': round(ret_ann * 100.0, 4),
         'filled_turnover_pct': round(to_f * 100.0, 4),
-        'fill_rate': round(filled / intended, 4) if intended > 1e-12 else 1.0,
+        'fill_rate': round(fill_rate, 4),
         'capped_cell_frac': round(float(((fill < 1.0 - 1e-9) & need).sum() / max(need.sum(), 1)), 4),
-        'shortfall_frac': round(1.0 - wfsum / wsum, 4) if wsum > 1e-12 else 0.0,
+        'shortfall_frac': round(max(0.0, 1.0 - fill_rate), 4),
         'realized_cost_bps': round(float(cost[1:].sum() / filled * 1e4), 4) if filled > 1e-12 else 0.0,
+        'borrow_cost_bps': round(float(borrow[1:].sum() / filled * 1e4), 4) if filled > 1e-12 else 0.0,
     }
+
+
+def capacity_frontier(Wd, R, adv, exec_cfg, borrow_fee=None, book_size=1.0,
+                      annualization=252.0, hurdle=1.0, n_grid=24,
+                      lo=1.0, hi=1e12, min_fill_rate=0.5):
+    """Sampled feasible frontier for HF net Sharpe and fill-rate constraints.
+
+    The bridge between daily alpha economics and LOB execution physics:
+    gross scales linearly in notional while sqrt-law impact + participation
+    caps scale superlinearly. This uses a log-grid scan only; it does not
+    assume monotonicity or use bisection. Feasibility requires net Sharpe >=
+    hurdle and fill_rate >= min_fill_rate. All HF machinery (fills, spread,
+    impact, borrow) is reused verbatim.
+    DIAGNOSTIC-ONLY — never enters gates.
+    Returns a sampled feasible frontier, not an exact crossing. Each curve
+    entry is (notional, net_sharpe, fill_rate).
+    """
+    lo, hi, hurdle = float(lo), float(hi), float(hurdle)
+    if not np.isfinite(lo) or not np.isfinite(hi) or not np.isfinite(hurdle):
+        raise ValueError("capacity grid lo, hi, and hurdle must be finite")
+    if lo <= 0 or hi <= lo:
+        raise ValueError("capacity grid requires 0 < lo < hi")
+    try:
+        n_grid_value = float(n_grid)
+    except (TypeError, ValueError):
+        raise ValueError("n_grid must be an integer >= 2")
+    if (isinstance(n_grid, bool) or not np.isfinite(n_grid_value)
+            or not n_grid_value.is_integer() or n_grid_value < 2):
+        raise ValueError("n_grid must be an integer >= 2")
+    n_grid = int(n_grid_value)
+    min_fill_rate = float(min_fill_rate)
+    if not np.isfinite(min_fill_rate):
+        raise ValueError("min_fill_rate must be finite")
+    if not 0.0 < min_fill_rate <= 1.0:
+        raise ValueError("min_fill_rate must be in (0,1]")
+    grid = [lo * (hi / lo) ** (k / (n_grid - 1)) for k in range(n_grid)]
+    curve = []
+    for n_ in grid:
+        cfg = dict(exec_cfg)
+        cfg['portfolio_notional'] = float(n_)
+        rep = _high_fidelity_report(Wd, R, adv, cfg, borrow_fee=borrow_fee,
+                                    book_size=book_size, annualization=annualization)
+        curve.append((float(n_), rep['net_sharpe'], rep['fill_rate']))
+    feasible = [n_ for n_, s_, f_ in curve if s_ >= hurdle and f_ >= min_fill_rate]
+    if not feasible:
+        return {'feasible': False, 'capacity_notional': None, 'net_sharpe_at_capacity': None,
+                'hurdle': hurdle, 'min_fill_rate': min_fill_rate,
+                'curve': [(round(n_, 2), s_, f_) for n_, s_, f_ in curve],
+                'note': 'sampled feasible frontier; hurdle unmet on sampled grid'}
+    cap = max(feasible)
+    s_cap = next(s_ for n_, s_, _ in curve if n_ == cap)
+    return {'feasible': True, 'capacity_notional': round(float(cap), 2),
+            'net_sharpe_at_capacity': s_cap,
+            'hurdle': hurdle, 'min_fill_rate': min_fill_rate,
+            'curve': [(round(n_, 2), s_, f_) for n_, s_, f_ in curve],
+            'note': 'sampled feasible frontier; capacity is the largest feasible grid point, not an exact crossing'}
 
 
 def _fitness(sharpe, ret_ann, turnover, floor=0.125):
@@ -520,6 +614,8 @@ def simulate(expr_str, panel, refs=(), own_refs=(), settings=None, cutoffs=None,
     `exec_settings` is an ExecutionSettings/dict for High-Fidelity mode.
     """
     st = _coerce_settings(settings)
+    from data_gen import validate_panel_provenance
+    validate_panel_provenance(panel)
     rep = {'expression': expr_str, 'settings': st.to_dict()}
     rep['dataset_id'] = getattr(panel, 'dataset_id', '') or ''
     rep['trial_logged'] = False
@@ -527,11 +623,10 @@ def simulate(expr_str, panel, refs=(), own_refs=(), settings=None, cutoffs=None,
         raise ValueError(f"mode must be fast_gate|high_fidelity, got {mode!r}")
     rep['mode'] = str(mode)
     exec_cfg = dict(DEFAULT_EXECUTION)
-    if exec_settings is not None:
-        if hasattr(exec_settings, 'to_dict'):
-            exec_cfg.update(exec_settings.to_dict())
-        else:
-            exec_cfg.update({k: v for k, v in dict(exec_settings).items()})
+    if str(mode) == "high_fidelity" and exec_settings is not None:
+        supplied = (exec_settings.to_dict() if hasattr(exec_settings, 'to_dict')
+                    else dict(exec_settings))
+        exec_cfg.update(ExecutionSettings(**supplied).to_dict())
     verify = str(st.unitHandling).upper() == "VERIFY"
     try:
         sig = _signal_from_expr(expr_str, panel, verify=verify)
@@ -543,9 +638,8 @@ def simulate(expr_str, panel, refs=(), own_refs=(), settings=None, cutoffs=None,
             try:
                 import selection as _sel
                 if _sel.AUTO_LOG:
-                    _sel.TrialRegistry().log(expr_str[:120], rep['dataset_id'],
-                                             st.to_dict(), 0.0, 0.0, False)
-                    rep['trial_logged'] = True
+                    rep['trial_logged'] = bool(_sel.TrialRegistry().log(
+                        expr_str[:120], rep['dataset_id'], st.to_dict(), 0.0, 0.0, False))
             except Exception:
                 pass
         return rep
@@ -682,9 +776,8 @@ def simulate(expr_str, panel, refs=(), own_refs=(), settings=None, cutoffs=None,
         try:
             import selection as _sel
             if _sel.AUTO_LOG:
-                _sel.TrialRegistry().log(expr_str[:120], dsid, st.to_dict(),
-                                         m['sharpe'], m['fitness'], rep['passed'])
-                rep['trial_logged'] = True
+                rep['trial_logged'] = bool(_sel.TrialRegistry().log(
+                    expr_str[:120], dsid, st.to_dict(), m['sharpe'], m['fitness'], rep['passed']))
         except Exception:
             pass
     # Phase 2 dual-mode: High-Fidelity lens shares the Fast-Gate front-end
@@ -693,6 +786,7 @@ def simulate(expr_str, panel, refs=(), own_refs=(), settings=None, cutoffs=None,
     if str(mode) == "high_fidelity":
         rep['high_fidelity'] = _high_fidelity_report(
             Wd, R, panel.fields.get('adv20', None), exec_cfg,
+            borrow_fee=panel.fields.get('borrow_fee'),
             book_size=book, annualization=ann)
         rep['exec_settings'] = {k: exec_cfg[k] for k in sorted(exec_cfg)}
     # Risk lens (Haugh Ch.2): VaR/ES reporting next to Sharpe metrics.

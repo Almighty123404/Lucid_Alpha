@@ -178,8 +178,10 @@ def evaluate(expr, panel, refs, own_refs=(), settings=None):
     if rep.get("error"):
         return {"expr": expr, "status": "error", "error": rep["error"], "diag": diag}
     score = _score(rep, expr)
+    from calibration import expected_real_adjustment, family_of_expression
+    expect_real = expected_real_adjustment(family_of_expression(expr))
     elig, promo = promotion_eligible(rep, TrialRegistry(), DSR_PROMOTE,
-                                     _selection.SCOPE)
+                                     _selection.SCOPE, expect_real=expect_real)
     tail_gap = rep.get("risk", {}).get("es_gap_t_vs_normal_99", float("inf"))
     if tail_gap != tail_gap:  # NaN (degenerate lens) sorts as +inf: never wins ties
         tail_gap = float("inf")

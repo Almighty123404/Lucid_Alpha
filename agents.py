@@ -2,7 +2,7 @@ import json
 import numpy as np
 import os
 
-from fastexpr import (parse, to_expr, WQError, field_names, backfilled_fields, has_division,
+from fastexpr import (parse, parse_program, to_expr, WQError, field_names, backfilled_fields, has_division,
                       bump_windows, add_backfill, swap_fields, wrap_ts_rank, wrap_decay,
                       wrap_group_neutralize, wrap_ts_delta, contains_group_neutralize,
                       wrap_trade_when, wrap_hump, wrap_truncate, wrap_regression_neut,
@@ -99,8 +99,8 @@ ALIGN_KEYWORDS = {
 }
 FIELD_FAMILY_TOKENS = {
     'sentiment': ('nws', 'snt', 'buzz', 'news'),
-    'fundamental': ('ebitda', 'sales', 'debt', 'assets', 'liabilit', 'est',
-                    'cogs', 'gross_profit', 'income', 'eps', 'equity',
+    'fundamental': ('ebitda', 'ebit', 'sales', 'debt', 'assets', 'liabilit', 'est',
+                    'cogs', 'gross_profit', 'income', 'expense', 'eps', 'equity',
                     'cash', 'retained', 'goodwill', 'working_capital',
                     'capex', 'dividends', 'tax', 'margin', 'revenue', 'fcf',
                     'ocf', 'analyst', 'recommendation', 'surprise', 'segment',
@@ -193,6 +193,7 @@ DIMENSIONS = {
     'goodwill': 'CCY', 'working_capital': 'CCY', 'operating_cash_flow': 'CCY',
     'capex': 'CCY', 'free_cash_flow': 'CCY', 'dividends_paid': 'CCY',
     'return_assets': 'LESS',
+    'operating_expense': 'CCY', 'ebit': 'CCY',
     'est_eps': 'CCY', 'est_revenue': 'CCY', 'est_eps_std': 'CCY',
     'recommendation': 'LESS', 'eps_surprise': 'LESS',
     'snt_news': 'LESS', 'snt_social': 'LESS', 'news_volume': 'COUNT',
@@ -282,6 +283,11 @@ def _dim_of(node, scope=()):
         if node.name in ('trade_when', 'if_else') and node.args:
             if _dim_of(node.args[0], scope) not in ('BOOL', 'LESS', 'NUM'):
                 raise WQError(f"{node.name} condition must be boolean-like")
+            if node.name == 'if_else' and len(node.args) == 3:
+                branches = [_dim_of(node.args[1], scope), _dim_of(node.args[2], scope)]
+                branches = [d for d in branches if d != 'NUM']
+                if len(branches) == 2 and branches[0] != branches[1]:
+                    raise WQError("if_else branches must have matching dimensions")
             return 'LESS'
         if node.name in ('vec_avg', 'vec_mean', 'vec_sum', 'vec_max', 'vec_min', 'vec_std'):
             for a in node.args:
@@ -308,11 +314,15 @@ def dimension_check(expr_str):
     Lenient by design: unknown fields default to dimensionless.
     """
     try:
-        node = parse(expr_str)
+        bindings, final = parse_program(expr_str)
     except WQError:
         return None
     try:
-        _dim_of(node)
+        scope = []
+        for binding in bindings:
+            _dim_of(binding.expr, scope)
+            scope.append(binding.name)
+        _dim_of(final, scope)
     except WQError as e:
         return [str(e)]
     return []

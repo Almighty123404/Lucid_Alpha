@@ -17,6 +17,13 @@ def test_determinism_same_seed_identical():
     assert np.array_equal(a.fields["close"], b.fields["close"], equal_nan=True)
 
 
+def test_generate_rejects_degenerate_dimensions():
+    with pytest.raises(ValueError, match="n_stocks"):
+        generate(seed=11, n_stocks=1, start="2020-01-01", end="2020-06-30")
+    with pytest.raises(ValueError, match="end"):
+        generate(seed=11, n_stocks=20, start="2020-06-30", end="2020-01-01")
+
+
 def test_sentiment_coverage_sparse(med_panel):
     cov = float(np.isfinite(med_panel.vector_fields["nws12_afterhsz_01l"][0]).mean())
     assert 0.01 <= cov <= 0.10  # real ~1-5%; old bug printed 47%
@@ -111,6 +118,9 @@ def test_codebook_extension_present(med_panel):
     assert "return_assets" in med_panel.fields  # G1 identity
     m3 = np.isfinite(med_panel.fields["return_assets"]) & np.isfinite(med_panel.fields["net_income"]) & np.isfinite(med_panel.fields["assets"])
     assert bool((((med_panel.fields["return_assets"] - med_panel.fields["net_income"] / np.maximum(med_panel.fields["assets"], 1e-12))[m3]) == 0).all())
+    assert "operating_expense" in med_panel.fields and "ebit" in med_panel.fields
+    m4 = np.isfinite(med_panel.fields["operating_expense"]) & np.isfinite(med_panel.fields["cogs"]) & np.isfinite(med_panel.fields["sales"])
+    assert bool((((med_panel.fields["operating_expense"] - med_panel.fields["cogs"])[m4] >= 0).all()))
     for v in ["analyst_eps_estimates", "option_implied_vol_surface",
               "segment_revenue", "price_volume_intraday"]:
         assert v in med_panel.vector_fields, v

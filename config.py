@@ -5,6 +5,7 @@ core. Users recalibrate APPROX-marked values against real Brain results and
 record pairs in calibration/*.json.
 """
 import json
+import numpy as np
 
 CONFIG_VERSION = "1.0.0"
 
@@ -120,6 +121,7 @@ DEFAULT_EXECUTION = {
     "max_participation": 0.10,  # FIFO back-of-queue proxy: fill at most this
                                # fraction of daily dollar liquidity per name
     "commission_bps": 1.0,     # fixed per-side commission
+    "portfolio_notional": None, # optional currency notional for HF capacity only
 }
 
 
@@ -127,7 +129,7 @@ class ExecutionSettings:
     """Execution-layer schema for High-Fidelity mode (Phase 2)."""
 
     FIELDS = ("mode", "spread_bps", "urgency", "lambda_perm", "eta_temp",
-              "alpha", "max_participation", "commission_bps")
+              "alpha", "max_participation", "commission_bps", "portfolio_notional")
 
     def __init__(self, **kw):
         cfg = dict(DEFAULT_EXECUTION)
@@ -139,6 +141,10 @@ class ExecutionSettings:
     def validate(self):
         if str(self.mode) not in ("fast_gate", "high_fidelity"):
             raise ValueError(f"mode must be fast_gate|high_fidelity, got {self.mode!r}")
+        for k in ("spread_bps", "urgency", "lambda_perm", "eta_temp",
+                  "alpha", "max_participation", "commission_bps"):
+            if not np.isfinite(float(getattr(self, k))):
+                raise ValueError(f"{k} must be finite")
         for k in ("spread_bps", "lambda_perm", "eta_temp", "commission_bps"):
             if not float(getattr(self, k)) >= 0:
                 raise ValueError(f"{k} must be >= 0")
@@ -148,6 +154,11 @@ class ExecutionSettings:
             raise ValueError("alpha must be in (0,1]")
         if not 0.0 < float(self.max_participation) <= 1.0:
             raise ValueError("max_participation must be in (0,1]")
+        if self.portfolio_notional is not None:
+            if isinstance(self.portfolio_notional, bool) or not np.isfinite(float(self.portfolio_notional)):
+                raise ValueError("portfolio_notional must be finite and > 0")
+            if float(self.portfolio_notional) <= 0:
+                raise ValueError("portfolio_notional must be finite and > 0")
 
     def to_dict(self):
         return {k: getattr(self, k) for k in self.FIELDS}

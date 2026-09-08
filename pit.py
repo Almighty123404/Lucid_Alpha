@@ -10,6 +10,15 @@ semantics — see pit_asof).
 """
 import numpy as np
 
+
+def _checked_decisions(decision_dates):
+    decisions = np.asarray(decision_dates).astype('datetime64[D]')
+    if decisions.ndim != 1 or len(decisions) == 0:
+        raise ValueError("decision_dates must be a non-empty 1D date array")
+    if np.any(decisions[1:] < decisions[:-1]):
+        raise ValueError("decision_dates must be sorted ascending")
+    return decisions
+
 try:
     import duckdb
     DUCKDB_OK = True
@@ -47,7 +56,7 @@ def build_revision_log(period_ends, values_q, field, rng,
     return rows
 
 
-def pit_asof(rows, decision_dates, report_lag_days=0):
+def pit_asof(rows, decision_dates, report_lag_days=0, return_provenance=False):
     """Serve leak-free panels via DuckDB (single query per field).
 
     Returns (values (T,N), knowledge (T,N) datetime64): per (decision, sid)
@@ -64,61 +73,68 @@ def pit_asof(rows, decision_dates, report_lag_days=0):
     """
     if not DUCKDB_OK:
         raise RuntimeError("duckdb is required for pit_asof (pip install duckdb)")
-    decisions = np.asarray(decision_dates).astype('datetime64[D]')
+    decisions = _checked_decisions(decision_dates)
     T = len(decisions)
     sids = sorted({r["sid"] for r in rows})
     N = (max(sids) + 1) if sids else 0
     lag = np.timedelta64(int(report_lag_days), 'D')
     con = duckdb.connect()
-    con.execute("CREATE TABLE rev(sid INTEGER, knowledge_ts DATE, "
-                "value DOUBLE, rev_seq INTEGER, pub_ts DATE)")
-    # Bulk columnar insert (profiled 2026-09-06): executemany row-at-a-time
-    # costs ~1.4s per 1.2k rows (~15s per full field); UNNEST column params
-    # transfer the same data in milliseconds.
-    _sid = np.array([r["sid"] for r in rows], dtype=np.int32)
-    _kn = np.empty(len(rows), dtype="datetime64[D]")
-    _pub = np.empty(len(rows), dtype="datetime64[D]")
-    _val = np.empty(len(rows), dtype=np.float64)
-    _seq = np.empty(len(rows), dtype=np.int32)
-    for i, r in enumerate(rows):
-        pe = np.datetime64(r["period_end"])
-        k = np.datetime64(r["knowledge_ts"])
-        _kn[i] = k if k >= pe + lag else pe + lag
-        _pub[i] = k
-        _val[i] = r["value"]
-        _seq[i] = r["rev_seq"]
-    con.execute("INSERT INTO rev SELECT * FROM "
-                "(SELECT UNNEST(CAST(? AS INTEGER[])) AS sid, "
-                "UNNEST(CAST(? AS DATE[])) AS knowledge_ts, "
-                "UNNEST(CAST(? AS DOUBLE[])) AS value, "
-                "UNNEST(CAST(? AS INTEGER[])) AS rev_seq, "
-                "UNNEST(CAST(? AS DATE[])) AS pub_ts)",
-                [_sid.tolist(), _kn.tolist(), _val.tolist(),
-                 _seq.tolist(), _pub.tolist()])
-    # Perf note (profiled 2026-09-06): executemany-inserting the TxN decision
-    # grid row-by-row costs ~40s per 78k cells; passing the grid as UNNEST
-    # parameters keeps the whole lookup near one second. Same-effective-day
-    # restatement collisions are measure-zero (offsets span 30-90d), so no
-    # secondary tiebreak is needed beyond the ASOF match.
-    dstr = [str(d) for d in decisions]
-    # Perf (profiled 2026-09-06): the ASOF JOIN must run over MATERIALIZED,
-    # pre-sorted inputs — against CTE/UNNEST legs the planner falls back to
-    # nested-loop (~30s per 783k cells); temp tables take the merge path
-    # (<1s). Non-matching decision cells are absent from ASOF output and
-    # stay NaN (correct: nothing knowable yet).
-    con.execute("CREATE TEMP TABLE dec AS WITH dd(dts) AS (SELECT UNNEST(CAST(? AS DATE[]))), "
-                "ss(sid) AS (SELECT UNNEST(CAST(? AS INTEGER[]))) SELECT * FROM dd CROSS JOIN ss",
-                [dstr, sids])
-    con.execute("CREATE TEMP TABLE revs AS SELECT * FROM rev ORDER BY sid, knowledge_ts")
-    got = con.execute(
-        "SELECT d.dts, d.sid, r.value, r.pub_ts FROM dec d "
-        "ASOF JOIN revs r ON (r.sid = d.sid AND r.knowledge_ts <= d.dts) "
-        "ORDER BY d.dts, d.sid").fetchall()
-    con.close()
-    return _assemble(got, decisions, T, N)
+    try:
+        con.execute("CREATE TABLE rev(sid INTEGER, period_end DATE, knowledge_ts DATE, "
+                    "value DOUBLE, rev_seq INTEGER, pub_ts DATE)")
+        # Bulk columnar insert (profiled 2026-09-06): executemany row-at-a-time
+        # costs ~1.4s per 1.2k rows (~15s per full field); UNNEST column params
+        # transfer the same data in milliseconds.
+        _sid = np.array([r["sid"] for r in rows], dtype=np.int32)
+        _period = np.empty(len(rows), dtype="datetime64[D]")
+        _kn = np.empty(len(rows), dtype="datetime64[D]")
+        _pub = np.empty(len(rows), dtype="datetime64[D]")
+        _val = np.empty(len(rows), dtype=np.float64)
+        _seq = np.empty(len(rows), dtype=np.int32)
+        for i, r in enumerate(rows):
+            pe = np.datetime64(r["period_end"])
+            _period[i] = pe
+            k = np.datetime64(r["knowledge_ts"])
+            _kn[i] = k if k >= pe + lag else pe + lag
+            _pub[i] = k
+            _val[i] = r["value"]
+            _seq[i] = r["rev_seq"]
+        con.execute("INSERT INTO rev SELECT * FROM "
+                    "(SELECT UNNEST(CAST(? AS INTEGER[])) AS sid, "
+                    "UNNEST(CAST(? AS DATE[])) AS period_end, "
+                    "UNNEST(CAST(? AS DATE[])) AS knowledge_ts, "
+                    "UNNEST(CAST(? AS DOUBLE[])) AS value, "
+                    "UNNEST(CAST(? AS INTEGER[])) AS rev_seq, "
+                    "UNNEST(CAST(? AS DATE[])) AS pub_ts)",
+                    [_sid.tolist(), _period.tolist(), _kn.tolist(), _val.tolist(),
+                     _seq.tolist(), _pub.tolist()])
+        # Perf note (profiled 2026-09-06): executemany-inserting the TxN decision
+        # grid row-by-row costs ~40s per 78k cells; passing the grid as UNNEST
+        # parameters keeps the whole lookup near one second. Same-effective-day
+        # restatement collisions are measure-zero (offsets span 30-90d), so no
+        # secondary tiebreak is needed beyond the ASOF match.
+        dstr = [str(d) for d in decisions]
+        # Perf (profiled 2026-09-06): the ASOF JOIN must run over MATERIALIZED,
+        # pre-sorted inputs — against CTE/UNNEST legs the planner falls back to
+        # nested-loop (~30s per 783k cells); temp tables take the merge path
+        # (<1s). Non-matching decision cells are absent from ASOF output and
+        # stay NaN (correct: nothing knowable yet).
+        con.execute("CREATE TEMP TABLE dec AS WITH dd(dts) AS (SELECT UNNEST(CAST(? AS DATE[]))), "
+                    "ss(sid) AS (SELECT UNNEST(CAST(? AS INTEGER[]))) SELECT * FROM dd CROSS JOIN ss",
+                    [dstr, sids])
+        con.execute("CREATE TEMP TABLE revs AS SELECT * FROM rev ORDER BY sid, period_end, knowledge_ts, rev_seq")
+        got = con.execute(
+            "SELECT d.dts, d.sid, r.value, r.pub_ts, r.period_end FROM dec d "
+            "LEFT JOIN revs r ON (r.sid = d.sid AND r.knowledge_ts <= d.dts) "
+            "QUALIFY ROW_NUMBER() OVER (PARTITION BY d.dts, d.sid "
+            "ORDER BY r.period_end DESC NULLS LAST, r.knowledge_ts DESC NULLS LAST, "
+            "r.rev_seq DESC NULLS LAST) = 1 ORDER BY d.dts, d.sid").fetchall()
+    finally:
+        con.close()
+    return _assemble(got, decisions, T, N, return_provenance)
 
 
-def pit_asof_multi(field_rows, decision_dates):
+def pit_asof_multi(field_rows, decision_dates, return_provenance=False):
     """Serve MULTIPLE fields in one DuckDB query (one shared decision grid).
 
     field_rows: {field: rows}. Returns {field: (values, knowledge)}. Same
@@ -130,66 +146,77 @@ def pit_asof_multi(field_rows, decision_dates):
     """
     if not DUCKDB_OK:
         raise RuntimeError("duckdb is required for pit_asof_multi (pip install duckdb)")
-    decisions = np.asarray(decision_dates).astype('datetime64[D]')
+    decisions = _checked_decisions(decision_dates)
     T = len(decisions)
     sids = sorted({r["sid"] for rows in field_rows.values() for r in rows})
     N = (max(sids) + 1) if sids else 0
     dstr = [str(d) for d in decisions]
     con = duckdb.connect()
-    parts, params = [], [dstr, sids]
-    for i, (field, rows) in enumerate(field_rows.items()):
-        con.execute("CREATE TABLE rev%d(sid INTEGER, knowledge_ts DATE, "
-                    "value DOUBLE, rev_seq INTEGER, pub_ts DATE)" % i)
-        _sid = np.array([r["sid"] for r in rows], dtype=np.int32)
-        _kn = np.empty(len(rows), dtype="datetime64[D]")
-        _pub = np.empty(len(rows), dtype="datetime64[D]")
-        _val = np.empty(len(rows), dtype=np.float64)
-        _seq = np.empty(len(rows), dtype=np.int32)
-        for j, r in enumerate(rows):
-            pe = np.datetime64(r["period_end"])
-            k = np.datetime64(r["knowledge_ts"])
-            _kn[j] = k  # effective knowledge precomputed by caller contract
-            _pub[j] = k
-            _val[j] = r["value"]
-            _seq[j] = r["rev_seq"]
-        con.execute("INSERT INTO rev%d SELECT * FROM "
-                    "(SELECT UNNEST(CAST(? AS INTEGER[])) AS sid, "
-                    "UNNEST(CAST(? AS DATE[])) AS knowledge_ts, "
-                    "UNNEST(CAST(? AS DOUBLE[])) AS value, "
-                    "UNNEST(CAST(? AS INTEGER[])) AS rev_seq, "
-                    "UNNEST(CAST(? AS DATE[])) AS pub_ts)" % i,
-                    [_sid.tolist(), _kn.tolist(), _val.tolist(),
-                     _seq.tolist(), _pub.tolist()])
-        con.execute("CREATE TEMP TABLE revs%d AS SELECT * FROM rev%d ORDER BY sid, knowledge_ts" % (i, i))
-    dstr = [str(d) for d in decisions]
-    con.execute("CREATE TEMP TABLE dec AS WITH dd(dts) AS (SELECT UNNEST(CAST(? AS DATE[]))), "
-                "ss(sid) AS (SELECT UNNEST(CAST(? AS INTEGER[]))) SELECT * FROM dd CROSS JOIN ss",
-                [dstr, sorted({r["sid"] for rows in field_rows.values() for r in rows})])
-    out = {}
-    names = list(field_rows.keys())
-    for i, field in enumerate(names):
-        got = con.execute(
-            "SELECT d.dts, d.sid, r.value, r.pub_ts FROM dec d "
-            "ASOF JOIN revs%d r ON (r.sid = d.sid AND r.knowledge_ts <= d.dts) "
-            "ORDER BY d.dts, d.sid" % i).fetchall()
-        out[field] = _assemble(got, decisions, T, N)
-    con.close()
+    try:
+        for i, (field, rows) in enumerate(field_rows.items()):
+            con.execute("CREATE TABLE rev%d(sid INTEGER, period_end DATE, knowledge_ts DATE, "
+                        "value DOUBLE, rev_seq INTEGER, pub_ts DATE)" % i)
+            _sid = np.array([r["sid"] for r in rows], dtype=np.int32)
+            _period = np.empty(len(rows), dtype="datetime64[D]")
+            _kn = np.empty(len(rows), dtype="datetime64[D]")
+            _pub = np.empty(len(rows), dtype="datetime64[D]")
+            _val = np.empty(len(rows), dtype=np.float64)
+            _seq = np.empty(len(rows), dtype=np.int32)
+            for j, r in enumerate(rows):
+                pe = np.datetime64(r["period_end"])
+                _period[j] = pe
+                k = np.datetime64(r["knowledge_ts"])
+                _kn[j] = k  # effective knowledge precomputed by caller contract
+                _pub[j] = k
+                _val[j] = r["value"]
+                _seq[j] = r["rev_seq"]
+            con.execute("INSERT INTO rev%d SELECT * FROM "
+                         "(SELECT UNNEST(CAST(? AS INTEGER[])) AS sid, "
+                         "UNNEST(CAST(? AS DATE[])) AS period_end, "
+                        "UNNEST(CAST(? AS DATE[])) AS knowledge_ts, "
+                        "UNNEST(CAST(? AS DOUBLE[])) AS value, "
+                        "UNNEST(CAST(? AS INTEGER[])) AS rev_seq, "
+                        "UNNEST(CAST(? AS DATE[])) AS pub_ts)" % i,
+                        [_sid.tolist(), _period.tolist(), _kn.tolist(), _val.tolist(),
+                         _seq.tolist(), _pub.tolist()])
+            con.execute("CREATE TEMP TABLE revs%d AS SELECT * FROM rev%d ORDER BY sid, period_end, knowledge_ts, rev_seq" % (i, i))
+        dstr = [str(d) for d in decisions]
+        con.execute("CREATE TEMP TABLE dec AS WITH dd(dts) AS (SELECT UNNEST(CAST(? AS DATE[]))), "
+                    "ss(sid) AS (SELECT UNNEST(CAST(? AS INTEGER[]))) SELECT * FROM dd CROSS JOIN ss",
+                    [dstr, sorted({r["sid"] for rows in field_rows.values() for r in rows})])
+        out = {}
+        names = list(field_rows.keys())
+        for i, field in enumerate(names):
+            got = con.execute(
+                "SELECT d.dts, d.sid, r.value, r.pub_ts, r.period_end FROM dec d "
+                "LEFT JOIN revs%d r ON (r.sid = d.sid AND r.knowledge_ts <= d.dts) "
+                "QUALIFY ROW_NUMBER() OVER (PARTITION BY d.dts, d.sid "
+                "ORDER BY r.period_end DESC NULLS LAST, r.knowledge_ts DESC NULLS LAST, "
+                "r.rev_seq DESC NULLS LAST) = 1 ORDER BY d.dts, d.sid" % i).fetchall()
+            out[field] = _assemble(got, decisions, T, N, return_provenance)
+    finally:
+        con.close()
     return out
 
 
-def _assemble(got, decisions, T, N):
+def _assemble(got, decisions, T, N, return_provenance=False):
     """Vectorized (tgrid, sid) assembly shared by pit_asof."""
-    darr = np.array([d for d, _, _, _ in got])
-    sarr = np.array([s for _, s, _, _ in got], dtype=np.int64)
-    varr = np.array([np.nan if v is None else v for _, _, v, _ in got])
+    darr = np.array([g[0] for g in got])
+    sarr = np.array([g[1] for g in got], dtype=np.int64)
+    varr = np.array([np.nan if g[2] is None else g[2] for g in got])
     tgrid = np.searchsorted(decisions, darr.astype("datetime64[D]"))
     vals = np.full((T, N), np.nan)
     kn = np.full((T, N), np.datetime64("NaT", "D"))
     has = ~np.isnan(varr)
     vals[tgrid[has], sarr[has]] = varr[has]
-    karr = np.array([str(k) if k is not None else "NaT" for _, _, _, k in got])
+    karr = np.array([str(g[3]) if g[3] is not None else "NaT" for g in got])
     kn[tgrid[has], sarr[has]] = karr[has].astype("datetime64[D]")
-    return vals, kn
+    if not return_provenance:
+        return vals, kn
+    parr = np.array([str(g[4]) if len(g) > 4 and g[4] is not None else "NaT" for g in got])
+    period = np.full((T, N), np.datetime64("NaT", "D"))
+    period[tgrid[has], sarr[has]] = parr[has].astype("datetime64[D]")
+    return vals, kn, period
 
 
 def build_revision_log_v2(period_ends, values_q, field, rng, liq_rank=None,
@@ -240,14 +267,14 @@ def build_revision_log_v2(period_ends, values_q, field, rng, liq_rank=None,
             pr = restate_p * (1.5 if (q4 and q4_bump) else 1.0)
             if rng.random() < pr:
                 n_extra = min(1 + int(rng.poisson(restate_lambda)), 3)
-                for _ in range(n_extra):
+                for seq in range(2, n_extra + 2):
                     k2 = kts + np.timedelta64(min(int(30 + rng.exponential(25)), 120), 'D')
                     sig = distress_sigma if (distress is not None and distress[q, j]) else rev_sigma
                     shift = -0.01 if (distress is not None and distress[q, j]) else 0.0
                     rows.append({"sid": int(j), "field": field,
                                  "period_end": str(pe), "knowledge_ts": str(k2),
                                  "value": v * float(1.0 + shift + rng.normal(0.0, sig)),
-                                 "rev_seq": 2})
+                                 "rev_seq": seq})
                     kts = k2
     return rows
 
@@ -259,7 +286,7 @@ def validate_pit(values, knowledge, decisions):
     (the period_end lag is enforced inside pit_asof's JOIN). Raises
     ValueError naming the first violation. Returns True.
     """
-    decisions = np.asarray(decisions).astype('datetime64[D]')
+    decisions = _checked_decisions(decisions)
     finite = np.isfinite(values)
     bad = finite & ~(knowledge <= decisions[:, None])
     if bad.any():

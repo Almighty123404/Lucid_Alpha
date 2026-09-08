@@ -16,5 +16,6 @@ context.json
 calibration/private_records.jsonl
 calibration/unsubmitted_records.jsonl
 calibration/unsubmitted_sim_*.jsonl
+calibration/secondsim_records.jsonl
 calibration/g6_coverage.jsonl
 calibration/g7_events.jsonl

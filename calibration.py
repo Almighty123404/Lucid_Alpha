@@ -88,8 +88,9 @@ def expected_real_adjustment(family=None, min_records=3):
                                      for r in pool if k in r["real_metrics"]
                                      and k in r["predicted_metrics"]])), 4)
             for k in sorted(keys)}
+    slope_pool = pool + load_unsubmitted_pairs() if fam_name == "global" else pool
     return {"bias": bias, "family": fam_name, "n": len(pool),
-            "fallback": fallback, "to_slope": turnover_slope(pool)}
+            "fallback": fallback, "to_slope": turnover_slope(slope_pool)}
 
 
 def expected_real_metrics(sim_metrics, adjustment):
@@ -132,7 +133,7 @@ def load_unsubmitted_pairs():
     import glob as _glob
     import json as _json
     import os as _os
-    files = sorted(_glob.glob(os.path.join(CALIB_DIR, "unsubmitted_sim_*.jsonl")),
+    files = sorted(_glob.glob(_os.path.join(CALIB_DIR, "unsubmitted_sim_*.jsonl")),
                    key=_os.path.getmtime)
     if not files:
         return []
@@ -188,8 +189,8 @@ def turnover_slope(pool=None, min_points=4, min_span=30.0, scope="pooled"):
 
 _FAMILY_TOKENS = {
     "sentiment": ("nws", "snt", "buzz", "news"),
-    "fundamental": ("ebitda", "sales", "debt", "assets", "margin", "lev", "est",
-                    "cogs", "gross_profit", "income", "eps", "equity",
+    "fundamental": ("ebitda", "ebit", "sales", "debt", "assets", "margin", "lev", "est",
+                    "cogs", "gross_profit", "income", "expense", "eps", "equity",
                     "cash", "retained", "goodwill", "working_capital",
                     "capex", "dividends", "tax", "revenue", "fcf",
                     "ocf", "analyst", "recommendation", "surprise", "segment",

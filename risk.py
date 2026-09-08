@@ -180,6 +180,35 @@ def risk_report(pnl_daily, nu=None):
     return out
 
 
+def trade_lens(pnl_daily, annualization=252.0):
+    """Firm-style trade lens (IIT competition backtester convention), diagnostic-only.
+
+    Sortino (mean/downside-std, annualized), Calmar (CAGR/max-drawdown) and
+    daily hit rate on one alpha's daily book-PnL series. Mirrors the
+    round-trip report fields (Sortino/Calmar/WinRate) so sim output reads
+    side-by-side with firm-style reports — with one documented difference:
+    ours are computed on daily BOOK PnL, theirs on per-trade round trips, so
+    compare direction/rank, never levels. Never enters gates.
+    """
+    x = np.asarray(pnl_daily, dtype=np.float64)
+    x = x[np.isfinite(x)]
+    out = {"n_days": int(len(x))}
+    if len(x) < 30:
+        return out
+    mu = float(x.mean())
+    down = x[x < 0]
+    dsd = float(down.std(ddof=1)) if len(down) > 1 else 0.0
+    out["sortino"] = round(float(mu / dsd * math.sqrt(annualization)), 4) if dsd > 1e-12 else 0.0
+    curve = np.cumsum(x)
+    peak = np.maximum.accumulate(curve)
+    dd = float((peak - curve).max())
+    out["max_drawdown"] = round(dd, 4)
+    cagr = float(curve[-1] / max(len(x) / annualization, 1e-12))
+    out["calmar"] = round(float(cagr / dd), 4) if dd > 1e-12 else float("nan")
+    out["hit_rate"] = round(float((x > 0).mean()), 4)
+    return out
+
+
 def conditional_risk(pnl_daily, window=252, alpha=0.95, nu=6):
     """Trailing-window VaR/ES series (risk given F_t, notes §1.2).
 

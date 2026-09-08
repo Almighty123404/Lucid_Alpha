@@ -18,6 +18,26 @@ def test_dataset_id_present_and_stable(panel):
     assert p2.dataset_id == panel.dataset_id  # deterministic fingerprint
 
 
+def test_dataset_id_captures_masks_groups_and_nan_class(panel):
+    from data_gen import fingerprint_panel
+    fields = dict(panel.fields)
+    groups = {k: v.copy() for k, v in panel.groups.items()}
+    sub = panel.subuniverse.copy()
+    base = fingerprint_panel(panel.dates, fields, panel.vector_fields,
+                              groups=groups, subuniverse=sub)
+    groups['sector'][0] += 1
+    assert fingerprint_panel(panel.dates, fields, panel.vector_fields,
+                             groups=groups, subuniverse=sub) != base
+    groups = {k: v.copy() for k, v in panel.groups.items()}
+    sub[0] = ~sub[0]
+    assert fingerprint_panel(panel.dates, fields, panel.vector_fields,
+                             groups=groups, subuniverse=sub) != base
+    fields['returns'] = fields['returns'].copy()
+    fields['returns'][0, 0] = 0.0 if not np.isfinite(fields['returns'][0, 0]) else np.nan
+    assert fingerprint_panel(panel.dates, fields, panel.vector_fields,
+                             groups=groups, subuniverse=panel.subuniverse) != base
+
+
 def test_unlogged_trial_gets_dsr_zero_and_blocked(panel, refs):
     rep = simulate("ts_mean(returns, 60)", panel, refs, (), settings=None)
     # Strip lineage the way a hand-built panel would lack it.

@@ -84,3 +84,29 @@ def test_alias_and_subindustry_support():
     assert family_of_expression("rank(ni)") == "fundamental"
     assert family_of_expression("ts_mean(pcr, 20)") == "derivatives"
     assert family_of_expression("vec_mean(analyst_eps_estimates)") == "fundamental"
+
+
+def test_dimension_program_and_if_else_branch_safety():
+    assert dimension_check("a=close+volume; rank(a)") != []
+    assert dimension_check("if_else(returns>0, close, volume)") != []
+
+
+def test_ternary_desugar_eval_dims():
+    from fastexpr import Env, eval_node, parse, to_expr
+    from data_gen import generate
+    panel = generate(seed=11, n_stocks=20, start='2020-01-01', end='2020-02-29')
+    env = Env(panel)
+    n = parse('close > open ? 1 : -1')
+    assert n.name == 'if_else' and len(n.args) == 3
+    assert to_expr(parse('a ? b : c ? d : e')) == 'if_else(a, b, if_else(c, d, e))'
+    o = eval_node(n, env)
+    assert o.shape == (panel.fields['returns'].shape[0], 20)
+    import numpy as _np
+    assert set(_np.unique(o[_np.isfinite(o)]).tolist()) <= {-1.0, 1.0}
+    assert dimension_check('close > open ? 1 : -1') == []
+    c = eval_node(parse('1 > 0 ? close : open'), env)
+    assert bool((_np.nan_to_num(c) == _np.nan_to_num(panel.fields['close'])).all())
+    import pytest as _pt
+    with _pt.raises(Exception):
+        parse('a ? b')
+
