@@ -12,6 +12,7 @@ reports/walkforward.json
 reports/runs.jsonl
 reports/trials.jsonl
 reports/gp_campaign.json
+reports/runs/
 context.json
 calibration/private_records.jsonl
 calibration/unsubmitted_records.jsonl

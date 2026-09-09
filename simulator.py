@@ -269,6 +269,25 @@ def _turnover_series(Wd):
     return np.abs(np.diff(Wd, axis=0)).sum(1)
 
 
+def _reporting_series(panel, Wd, raw_pnl, book, cost_bps):
+    """Daily reporting series (artifact layer) — pure addition, never gates.
+
+    Provides the time-aligned arrays the reporting module needs to render
+    equity/drawdown/turnover/exposure charts without re-running the pipeline:
+    dates, weights, daily turnover, raw PnL and the linear cost-lens PnL
+    (raw minus daily turnover * book * cost_bps, matching metrics.cost_drag).
+    """
+    turns = np.concatenate([[0.0], _turnover_series(Wd)])
+    cost = turns * book * (cost_bps / 1e4)
+    return {
+        'dates': [str(d) for d in panel.dates.astype('datetime64[D]')],
+        'weights': Wd,
+        'turnover': turns,
+        'raw_pnl': raw_pnl,
+        'cost_pnl': raw_pnl - cost,
+    }
+
+
 def _roll_std_plain(x, w, min_obs=5):
     """NaN-aware rolling std for the High-Fidelity impact model (Phase 2).
 
@@ -383,6 +402,10 @@ def _high_fidelity_report(Wd, R, adv, exec_cfg, borrow_fee=None, book_size=1.0, 
         'shortfall_frac': round(max(0.0, 1.0 - fill_rate), 4),
         'realized_cost_bps': round(float(cost[1:].sum() / filled * 1e4), 4) if filled > 1e-12 else 0.0,
         'borrow_cost_bps': round(float(borrow[1:].sum() / filled * 1e4), 4) if filled > 1e-12 else 0.0,
+        # Daily diagnostic series (reporting only; never gates). Series are
+        # dollar-denominated when portfolio_notional is set, else book-fraction.
+        'gross_pnl': gross,
+        'net_pnl': net,
     }
 
 
@@ -768,6 +791,8 @@ def simulate(expr_str, panel, refs=(), own_refs=(), settings=None, cutoffs=None,
         'max_weight_dates': top_w,
         'passed': bool(all(c['pass'] for c in criteria.values())),
         'pnl': m['pnl'],
+        '_report': _reporting_series(panel, Wd, m['pnl'], book,
+                                     float(get_cutoff("cost_bps", cutoffs))),
     })
     # Core Operational Invariant 2 — STRICT LINEAGE: log this completed trial
     # (error trials were already logged above; log here exactly once).
@@ -826,7 +851,7 @@ def build_reference_pool(panel, named_exprs, settings=None):
 
 
 def save_report(rep, path):
-    slim = {k: v for k, v in rep.items() if k != 'pnl'}
+    slim = {k: v for k, v in rep.items() if k != 'pnl' and not str(k).startswith('_')}
     with open(path, 'w') as f:
         json.dump(slim, f, indent=2, default=str)
 
