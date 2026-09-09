@@ -779,10 +779,7 @@ features:
 
 ### Author and maintainer
 
-**Almighty123404** is the repository owner and maintainer. The handle is used
-because no legal name was supplied in the repository metadata. Before a formal
-commercial or institutional release, replace the handle in the copyright notice
-with the copyright holder's legal or registered organization name if required.
+**Abhinav Tiwari** (https://github.com/Almighty123404) is the repository owner and maintainer. 
 
 ### License
 
