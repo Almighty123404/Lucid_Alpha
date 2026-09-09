@@ -30,6 +30,24 @@ def _build_panel(dataset, seed):
     return generate(seed=seed, n_stocks=1000)
 
 
+def _settings_dict(args):
+    """Build an optional SimulationSettings dict from CLI flags (all optional).
+
+    Returns None when no setting was supplied, so simulate() falls back to its
+    defaults. This is a pure addition; the engine contract is unchanged.
+    """
+    d = {}
+    if getattr(args, "universe", None):
+        d["universe"] = args.universe
+    if getattr(args, "neutralization", None):
+        d["neutralization"] = args.neutralization
+    if getattr(args, "truncation", None) is not None:
+        d["truncation"] = float(args.truncation)
+    if getattr(args, "decay", None) is not None:
+        d["decay"] = int(args.decay)
+    return d or None
+
+
 def _extra(rep, expr):
     """DSR + expected-real debiased metrics for the executive screen."""
     out = {}
@@ -70,9 +88,14 @@ def _summary(rep, run_dir):
 
 
 def cmd_simulate(args):
-    expr = open(args.expr_file, encoding="utf-8").read().strip() if os.path.exists(args.expr_file) else args.expr_file
+    if getattr(args, "expr", None) is not None:
+        expr = args.expr.strip()
+    elif os.path.exists(getattr(args, "expr_file", "") or ""):
+        expr = open(args.expr_file, encoding="utf-8").read().strip()
+    else:
+        expr = getattr(args, "expr_file", None)
     panel = _build_panel(args.dataset, args.seed)
-    rep = simulate(expr, panel, (), (), settings=None, mode=args.mode)
+    rep = simulate(expr, panel, (), (), settings=_settings_dict(args), mode=args.mode)
     from reporting import build_run_artifact, hash_expr
     run_dir, manifest = build_run_artifact(rep, expr, seed=args.seed, mode=args.mode,
                                            include_private=args.include_private,
@@ -95,7 +118,7 @@ def cmd_batch(args):
             if not expr:
                 continue
             panel = _build_panel(args.dataset, args.seed)
-            rep = simulate(expr, panel, (), (), settings=None, mode=args.mode)
+            rep = simulate(expr, panel, (), (), settings=_settings_dict(args), mode=args.mode)
             build_run_artifact(rep, expr, seed=args.seed, mode=args.mode,
                                include_private=args.include_private,
                                extra=_extra(rep, expr) if not args.verbose else {},
@@ -138,10 +161,17 @@ def main(argv=None):
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("simulate")
-    s.add_argument("--expr-file", required=True)
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument("--expr-file", default=None)
+    g.add_argument("--expr", default=None)
     s.add_argument("--seed", type=int, default=11)
     s.add_argument("--dataset", default="synthetic", choices=["synthetic", "real"])
     s.add_argument("--mode", default="fast_gate", choices=["fast_gate", "high_fidelity"])
+    s.add_argument("--universe", default=None, choices=["TOP3000", "TOP1000", "TOP500", "TOP200"])
+    s.add_argument("--neutralization", default=None,
+                   choices=["NONE", "MARKET", "SECTOR", "INDUSTRY", "SUBINDUSTRY", "COUNTRY", "EXCHANGE"])
+    s.add_argument("--truncation", type=float, default=None)
+    s.add_argument("--decay", type=int, default=None)
     s.add_argument("--output", default="reports/runs")
     s.add_argument("--include-private", action="store_true")
     s.add_argument("--verbose", action="store_true")
@@ -151,6 +181,11 @@ def main(argv=None):
     b.add_argument("--seed", type=int, default=11)
     b.add_argument("--dataset", default="synthetic", choices=["synthetic", "real"])
     b.add_argument("--mode", default="fast_gate", choices=["fast_gate", "high_fidelity"])
+    b.add_argument("--universe", default=None, choices=["TOP3000", "TOP1000", "TOP500", "TOP200"])
+    b.add_argument("--neutralization", default=None,
+                   choices=["NONE", "MARKET", "SECTOR", "INDUSTRY", "SUBINDUSTRY", "COUNTRY", "EXCHANGE"])
+    b.add_argument("--truncation", type=float, default=None)
+    b.add_argument("--decay", type=int, default=None)
     b.add_argument("--output", default="reports/runs")
     b.add_argument("--include-private", action="store_true")
     b.add_argument("--verbose", action="store_true")

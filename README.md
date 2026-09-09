@@ -39,6 +39,7 @@ implementation.
 - [Alpha Expressions](#alpha-expressions)
 - [Simulation and Configuration](#simulation-and-configuration)
 - [Command-Line Interface](#command-line-interface)
+- [Web Studio & Python SDK](#web-studio--python-sdk)
 - [Competition Workflow](#competition-workflow)
 - [Run Artifacts](#run-artifacts)
 - [Dashboard and Reports](#dashboard-and-reports)
@@ -503,6 +504,83 @@ python -m fastexp.cli audit --run-id RUN_A --output reports/runs
 The audit checks the manifest, required files, private-data flag, and expression
 leakage in provenance.
 
+## Web Studio & Python SDK
+
+Fastexp ships a zero-CLI **Web Studio** and a matching **Python SDK** so
+researchers can build, run, track, and compare simulations without touching the
+shell — while producing the exact same immutable `reports/runs/<run_id>/`
+artifacts as the CLI. Both wrap the existing engine; neither modifies the
+simulation math or gate logic.
+
+### Web Studio
+
+Start the local server:
+
+```bash
+python -m fastexp.server                # http://127.0.0.1:8000
+python -m fastexp.server --port 9000
+```
+
+The studio provides:
+
+- **Alpha Formula Playground** — a Monaco editor with syntax highlighting,
+  operator/field autocomplete, real-time linting (balanced parentheses and
+  unknown-name checks), and a slide-out Operator Reference drawer.
+- **Preset Templates** — momentum, mean reversion, volume shock, quality, low/high
+  volatility, and asset turnover.
+- **Parameter Configurator** — dataset, mode, seed, universe, neutralization,
+  truncation slider, decay, and an include-private toggle with a warning badge.
+- **Batch Upload** — a drag-and-drop zone accepting `.txt` (one expression per
+  line) or `.jsonl` (batch lists).
+- **Job Queue** — a live table of `QUEUED / RUNNING / PASS / FAIL / BLOCKED /
+  ERROR / STOPPED` jobs with per-job Stop and Open Report controls.
+- **Live Console** — a collapsible, color-coded terminal streaming execution
+  output in real time over a WebSocket, with an Open Interactive Report action
+  on completion.
+- **Runs Browser** — every run listed with Dashboard and Report links, served
+  directly from the artifact directory.
+
+Backend endpoints (local-first FastAPI service, `fastexp/server.py`):
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/v1/simulate` | Start a single-expression run |
+| `POST /api/v1/batch` | Start a batch from a JSON list of expressions |
+| `POST /api/v1/batch/upload` | Start a batch from an uploaded `.txt`/`.jsonl` file |
+| `GET /api/v1/runs` | List artifact runs |
+| `GET /api/v1/jobs` / `GET /api/v1/jobs/{id}` | List / poll execution jobs |
+| `GET /api/v1/ws/logs/{job_id}` | WebSocket live stdout/stderr stream |
+| `POST /api/v1/runs/stop` | Terminate a running job |
+| `GET /api/v1/operators` / `GET /api/v1/templates` | Editor autocomplete/docs data |
+
+### Python SDK
+
+For Jupyter notebooks and scripts, the same engine is available as:
+
+```python
+import fastexp as fe
+
+run = fe.simulate(expr="rank(ts_zscore(close, 120))",
+                  dataset="synthetic", mode="fast_gate", seed=11)
+
+run.show_dashboard()      # interactive Plotly dashboard inline (Jupyter)
+run.show_report()         # static SVG report (offline-safe, always renders)
+df = run.equity_curve     # pandas.DataFrame (list-of-dicts fallback without pandas)
+print(run.run_id, run.status, run.metrics)
+```
+
+A `Run` exposes `run_id`, `status`, `passed`, `metrics`, `criteria`,
+`manifest`, `summary`, and the tabular artifacts `equity_curve`, `drawdown`,
+`exposures`, `yearly`, and `periods`. `fe.batch(expressions)` returns a list of
+`Run` objects. SDK runs reuse `simulator.simulate` + `reporting.build_run_artifact`,
+so they are byte-compatible with CLI and Studio runs.
+
+> The SDK is lazy-loaded: `import fastexp` stays lightweight, and `pandas` /
+> `IPython` are only imported when `Run` display or DataFrame access is used.
+> The Web Studio adds `fastapi`, `uvicorn`, `websockets`, `python-multipart`, and
+> `httpx` (test client) to `requirements.txt`; the core engine and test suite
+> remain dependency-light.
+
 ## Competition Workflow
 
 `run.py` is the high-level competition entry point:
@@ -704,7 +782,10 @@ the full test suite. Tests are synthetic-only and do not require network access.
 | `run.py` | High-level competition entry point and reference pool |
 | `reporting.py` | Artifact writer, static SVG report, Plotly dashboard, compare, and audit support |
 | `fastexp/cli.py` | `simulate`, `batch`, `compare`, and `audit` commands |
-| `tests/` | Unit, integration, governance, and reporting tests |
+| `fastexp/server.py` | Local FastAPI Web Studio service (async subprocess orchestration, REST + WebSocket) |
+| `fastexp/sdk.py` | Python SDK: `simulate`/`batch` returning a `Run` with DataFrame and inline-display accessors |
+| `fastexp/web/` | Web Studio frontend (Monaco editor, parameter form, queue, console) |
+| `tests/` | Unit, integration, governance, reporting, studio/SDK tests |
 | `scripts/` | Calibration, walk-forward, GP campaign, family-grid, debugging, and context utilities |
 | `reports/` | Regenerable competition outputs and research logs |
 | `calibration/` | Calibration schemas and local JSONL records; private files are ignored |

@@ -4,3 +4,8 @@ pytest==9.1.1  # test suite (tests/); synthetic-only, no network required
 numba==0.62.1  # Phase 2 execution kernels (kernels.py); numpy fallback if absent
 llvmlite==0.45.1  # numba backend pin
 duckdb==1.5.5  # Phase 4 PIT engine (pit.py revision logs + leak-free lookup)
+fastapi==0.141.1  # Web Studio API (fastexp/server.py; optional, not needed for CLI/tests)
+uvicorn==0.49.0  # ASGI server for the Web Studio
+websockets==15.0.1  # WebSocket transport for live log streaming
+python-multipart==0.0.32  # multipart uploads (batch file drop)
+httpx==0.28.1  # Web Studio test client (fastapi TestClient / tests/test_studio.py)

@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fastexp Web Studio</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/static/style.css">
+<script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/loader.js"></script>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="logo">ƒ</span> Fastexp <span class="dim">Web Studio</span></div>
+  <div class="hdr-right">
+    <span id="conn" class="pill warn">connecting…</span>
+    <button id="btn-docs" class="btn ghost">Operator Reference</button>
+  </div>
+</header>
+
+<div class="layout">
+  <!-- left: playground -->
+  <section class="col play">
+    <div class="card editor-card">
+      <div class="card-head">
+        <h2>Alpha Formula</h2>
+        <select id="template" title="Load a preset template">
+          <option value="">— Templates —</option>
+        </select>
+      </div>
+      <div id="editor" class="editor"></div>
+      <div id="lint" class="lint"></div>
+      <div class="editor-foot">
+        <span id="expr-status" class="muted">0 chars</span>
+        <button id="btn-validate" class="btn ghost small">Validate</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2>Parameters</h2></div>
+      <div class="form-grid">
+        <label>Dataset
+          <select id="p-dataset">
+            <option value="synthetic" selected>Synthetic (seeded, 1000 names)</option>
+            <option value="real">Real Market (yfinance, 200 names)</option>
+          </select>
+        </label>
+        <label>Mode
+          <select id="p-mode">
+            <option value="fast_gate" selected>Fast Gate</option>
+            <option value="high_fidelity">High Fidelity (diagnostic)</option>
+          </select>
+        </label>
+        <label>Seed
+          <input id="p-seed" type="number" value="11" min="0" step="1">
+        </label>
+        <label>Universe
+          <select id="p-universe">
+            <option value="" selected>Default (TOP3000)</option>
+            <option>TOP3000</option><option>TOP1000</option>
+            <option>TOP500</option><option>TOP200</option>
+          </select>
+        </label>
+        <label>Neutralization
+          <select id="p-neutralization">
+            <option value="" selected>Default (INDUSTRY)</option>
+            <option>NONE</option><option>MARKET</option><option>SECTOR</option>
+            <option>INDUSTRY</option><option>SUBINDUSTRY</option>
+            <option>COUNTRY</option><option>EXCHANGE</option>
+          </select>
+        </label>
+        <label>Truncation <span id="trunc-val" class="muted">0.05</span>
+          <input id="p-truncation" type="range" min="0.01" max="0.10" step="0.01" value="0.05">
+        </label>
+        <label>Decay
+          <input id="p-decay" type="number" value="4" min="0" step="1">
+        </label>
+        <label class="toggle-label">Include private expression
+          <span class="toggle"><input id="p-private" type="checkbox"><i></i></span>
+          <span id="private-warn" class="warn-badge hidden">WARNING: writes raw expression</span>
+        </label>
+      </div>
+      <div class="actions">
+        <button id="btn-run" class="btn primary">▶ Run Simulation</button>
+        <button id="btn-batch" class="btn">Run as Batch</button>
+        <button id="btn-stop" class="btn danger" disabled>■ Stop</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2>Batch Input <span class="muted">(one expression per line)</span></h2></div>
+      <div id="dropzone" class="dropzone">
+        Drag &amp; drop a <code>.txt</code> or <code>.jsonl</code> file here, or
+        <label class="link">browse<input type="file" id="file-input" accept=".txt,.jsonl" class="hidden"></label>
+      </div>
+      <textarea id="batch" rows="5" spellcheck="false"
+        placeholder="rank(ts_zscore(close, 120))&#10;-ts_zscore(returns, 21)&#10;rank(volume / ts_mean(volume, 20))"></textarea>
+    </div>
+  </section>
+
+  <!-- right: queue + results + console -->
+  <section class="col res">
+    <div class="card">
+      <div class="card-head">
+        <h2>Job Queue</h2>
+        <button id="btn-jobs-refresh" class="btn ghost small">Refresh</button>
+      </div>
+      <div id="jobs" class="jobs">No jobs yet.</div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>Runs</h2>
+        <button id="btn-refresh" class="btn ghost small">Refresh</button>
+      </div>
+      <div id="runs" class="runs">Loading…</div>
+    </div>
+
+    <div class="card console-card">
+      <div class="card-head">
+        <h2>Live Console</h2>
+        <span class="hdr-actions">
+          <button id="btn-console-toggle" class="btn ghost small">Collapse</button>
+          <button id="btn-clear" class="btn ghost small">Clear</button>
+        </span>
+      </div>
+      <pre id="console" class="console"><span class="muted">Awaiting first run. Hit ▶ Run Simulation.</span></pre>
+    </div>
+  </section>
+</div>
+
+<!-- operator reference drawer -->
+<div id="drawer" class="drawer hidden">
+  <div class="drawer-head">
+    <h2>Operator Reference</h2>
+    <button id="drawer-close" class="btn ghost small">✕</button>
+  </div>
+  <input id="op-search" placeholder="Search operators / fields…" class="search">
+  <div id="op-list" class="op-list"></div>
+</div>
+<div id="scrim" class="scrim hidden"></div>
+
+<script>
+require.config({ paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs' } });
+require(['vs/editor/editor.main'], function () { window.__monacoReady = true; });
+</script>
+<script src="/static/app.js"></script>
+</body>
+</html>
