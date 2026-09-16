@@ -1,6 +1,6 @@
-# Fastexp Agent Lab
+# Lucid Alpha
 
-Fastexp is a reproducible, artifact-first quantitative research laboratory for
+Lucid Alpha is a reproducible, artifact-first quantitative research laboratory for
 testing alpha expressions, simulating portfolio behavior, calibrating synthetic
 data against real observations, and running Brain-style research competitions.
 
@@ -20,11 +20,11 @@ The project combines:
   promotion-lineage controls.
 - Privacy-aware run artifacts, static reports, and an interactive dashboard.
 
-Fastexp is a research and simulation tool. It is not a trading system, a
+Lucid Alpha is a research and simulation tool. It is not a trading system, a
 brokerage integration, investment advice, or an official WorldQuant Brain
 implementation.
 
-[![CI](https://github.com/Almighty123404/Fastexp-Agent-Lab/actions/workflows/ci.yml/badge.svg)](https://github.com/Almighty123404/Fastexp-Agent-Lab/actions/workflows/ci.yml)
+[![CI](https://github.com/Almighty123404/lucid-alpha/actions/workflows/ci.yml/badge.svg)](https://github.com/Almighty123404/lucid-alpha/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.13-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](#license)
 
@@ -506,7 +506,7 @@ leakage in provenance.
 
 ## Web Studio & Python SDK
 
-Fastexp ships a zero-CLI **Web Studio** and a matching **Python SDK** so
+Lucid Alpha ships a zero-CLI **Web Studio** and a matching **Python SDK** so
 researchers can build, run, track, and compare simulations without touching the
 shell — while producing the exact same immutable `reports/runs/<run_id>/`
 artifacts as the CLI. Both wrap the existing engine; neither modifies the
@@ -792,7 +792,7 @@ the full test suite. Tests are synthetic-only and do not require network access.
 | `cache/` | Local downloaded market-data snapshots; ignored by Git |
 | `risk_register.json` | Project risk and evidence register |
 | `Dockerfile` | Reproducible test container |
-| `LICENSE` | MIT license for original Fastexp source |
+| `LICENSE` | MIT license for original Lucid Alpha source |
 | `.github/workflows/ci.yml` | Continuous integration workflow |
 
 ## Privacy, Copyright, and Data Governance
@@ -820,12 +820,12 @@ SEC rate limits, applicable exchange terms, and any internal data license.
 ### Names and trademarks
 
 WorldQuant and Brain are referenced only to describe the research inspiration
-and compatibility target. Fastexp is independent and is not endorsed by,
+and compatibility target. Lucid Alpha is independent and is not endorsed by,
 sponsored by, or affiliated with WorldQuant. No WorldQuant source code, private
 records, credentials, logos, or proprietary documentation are included.
 
 The source code in this repository was written for this project. Third-party
-packages remain under their own licenses and are not relicensed by the Fastexp
+packages remain under their own licenses and are not relicensed by the Lucid Alpha
 MIT license. Plotly is loaded from its public CDN and is not copied into this
 repository. CSS font-family names are references only; no font files are
 bundled.
@@ -867,7 +867,7 @@ features:
 Copyright (c) 2026 Almighty123404.
 
 This project is released under the MIT License. The complete legal text is in
-[`LICENSE`](LICENSE). The MIT license applies to the original Fastexp source in
+[`LICENSE`](LICENSE). The MIT license applies to the original Lucid Alpha source in
 this repository; it does not change the licenses or terms of third-party
 packages, external data, or referenced research.
 
@@ -917,7 +917,7 @@ affiliation or endorsement.
 ### Related public implementation reference
 
 The S1 relative sub-universe formula was cross-checked against the public
-`dafu-zhu/alpha-lab` project during research. Fastexp does not copy source code
+`dafu-zhu/alpha-lab` project during research. Lucid Alpha does not copy source code
 from that project:
 
 <https://github.com/dafu-zhu/alpha-lab>
